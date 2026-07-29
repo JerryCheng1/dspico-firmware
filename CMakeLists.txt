@@ -5,6 +5,9 @@ project(DSpico_project C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
+
+option(ENABLE_PSRAM_ROM_CACHE "Cache ROM blocks in the external APS6404 PSRAM (GPIO22-26/29)" ON)
+
 add_compile_definitions(DSpico
   PICO_STACK_SIZE=0x600
   PICO_CORE1_STACK_SIZE=0x400
@@ -36,6 +39,10 @@ add_executable(DSpico
   src/ntrCardRomGameNoScramble.h
   src/ntrCardRomGameSd.cpp
   src/ntrCardRomGameR4.cpp
+  src/psram.c
+  src/psram.h
+  src/romCache.c
+  src/romCache.h
   src/ntrCardRomGameUsb.cpp
   src/ntrCardRomGameUsb.h
   src/usbEventQueue.c
@@ -79,6 +86,12 @@ add_executable(DSpico
 if(EXISTS "${CMAKE_SOURCE_DIR}/roms/default.nds" AND EXISTS "${CMAKE_SOURCE_DIR}/roms/dsimode.nds")
   target_compile_definitions(DSpico PRIVATE
     DETECT_CONSOLE_TYPE # This macro enables the firmware to switch the rom based on which console is detected. You shouldn't change this.
+  )
+endif()
+
+if(ENABLE_PSRAM_ROM_CACHE)
+  target_compile_definitions(DSpico PRIVATE
+    ENABLE_PSRAM_ROM_CACHE
   )
 endif()
 

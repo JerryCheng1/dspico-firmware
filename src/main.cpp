@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
+#include "hardware/clocks.h"
 #include "hardware/structs/scb.h"
 #include "pico/binary_info.h"
 #include "ntrCard.pio.h"
@@ -19,6 +20,10 @@
 #include "pico/bootrom.h"
 #include "hardware/xosc.h"
 #include "powerSaving.h"
+#ifdef ENABLE_PSRAM_ROM_CACHE
+#include "psram.h"
+#include "romCache.h"
+#endif
 
 static u32 sProgramOffset;
 FATFS sFatFs;
@@ -248,6 +253,9 @@ static inline void earlyGpioInit(void)
     // Disable all unused GPIO inputs. Saves a little power.
 #if 1
     uint32_t usedPins = NTRC_PIN_MASK | SDIO_PIN_MASK | DEV_UART_PIN_MASK;
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    usedPins |= PSRAM_PIN_MASK;
+#endif
     for(uint32_t i = 0; i < NUM_BANK0_GPIOS; i++)
     {
         if(!(usedPins & 1u))
@@ -358,6 +366,10 @@ int __time_critical_func(main)()
 
     tryRebootToBootsel();
 
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    romCacheInit();
+#endif
+
     pwr_initPowerSaving();
 
     while (1)
@@ -366,6 +378,9 @@ int __time_critical_func(main)()
         gSdCard.Update();
     #ifdef ENABLE_R4_MODE
         ntrc_gameR4Update();
+    #endif
+    #ifdef ENABLE_PSRAM_ROM_CACHE
+        romCacheUpdate();
     #endif
         __wfi();
     }
