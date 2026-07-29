@@ -36,6 +36,12 @@ For an overview of the supported card commands, see [commands.md](docs/commands.
 |             | DAT2                  | GPIO07            |
 |             | DAT3                  | GPIO08            |
 |             | CMD                   | GPIO04            |
+| **PSRAM** (DSPICOwithPSRAM only) | SIO0     | GPIO22            |
+|             | SIO1                  | GPIO23            |
+|             | SIO2                  | GPIO24            |
+|             | SIO3                  | GPIO25            |
+|             | SCLK                  | GPIO26            |
+|             | CE                    | GPIO29            |
 
 ## Setup & configuration
 We recommend using WSL (Windows Subsystem for Linux), or a Unix-based machine to compile this repository.
