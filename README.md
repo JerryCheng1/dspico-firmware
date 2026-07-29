@@ -55,12 +55,22 @@ The steps provided will assume a Linux environment. Alternatively, you can run t
 ### CMakeList
 The `CMakeList.txt` file contains a couple of options that you can configure.
 
-   * `ENABLE_R4_MODE` - Enables R4 emulation. This allows you to use R4 software, such as the Wood R4 kernel. As R4 emulation can be used together with regular DSpico software, it can usually be kept enabled.
+Options passed on the cmake command line with `-D<name>=ON/OFF`:
+
+   * `ENABLE_PSRAM_ROM_CACHE` - Caches ROM blocks read through the R4 protocol in the external 64 Mbit APS6404 PSRAM (GPIO22-26/29, see the DSPICOwithPSRAM hardware), so repeated reads no longer hit the SD card. **Default: ON.** The firmware falls back to normal behaviour when no working PSRAM is detected at boot. Mutually exclusive with `DSPICO_ENABLE_WRFUXXED` (see below); in WRFUXXED builds the cache automatically uses a slower bit-banged PSRAM data path.
+   * `ENABLE_UART_LOG` - Prints firmware logs (including PSRAM detection and cache hit-rate statistics) on the debug UART (GPIO0/1, 115200 8N1). **Default: OFF.** When disabled, all log statements are compiled out and the UART stdio is not initialized.
+
+Defines toggled by (un)commenting them in the `add_compile_definitions` block of `CMakeLists.txt`:
+
+   * `ENABLE_R4_MODE` - Enables R4 emulation. This allows you to use R4 software, such as the Wood R4 kernel. As R4 emulation can be used together with regular DSpico software, it can usually be kept enabled. **Default: enabled.**
       * Note that to be able to use R4 software, your SD card must be at most 4 GB, or have a single partition in the first 4 GB of the SD card. R4 card commands cannot address SD sectors above 4 GB!
-   * `DSPICO_ENABLE_WRFUXXED` - Enables emulation of the IS-SPI-USB-ADAPTER to support the WRFUxxed exploit. This requires <code>uartBufv060.bin</code> to be placed in the `data/` folder.
-   * `ENABLE_PREVENT_DSI_AUTOBOOT` - Experimental feature that prevents DSi consoles from autobooting when the autoboot flag is set. It was intended to be used with WRFU Tester, which has the autoboot flag set. It is generally not recommended to use this, as it does not work properly with the 3DS and has not been tested much.
-   * `ENABLE_PSRAM_ROM_CACHE` - Caches ROM blocks read through the R4 protocol in the external 64 Mbit APS6404 PSRAM (GPIO22-26/29, see the DSPICOwithPSRAM hardware), so repeated reads no longer hit the SD card. Enabled by default; the firmware falls back to normal behaviour when no working PSRAM is detected at boot.
-   * `ENABLE_UART_LOG` - Prints firmware logs (including PSRAM cache statistics) on the debug UART (GPIO0/1). Disabled by default; when disabled, all log statements are compiled out and the UART stdio is not initialized.
+   * `DSPICO_ENABLE_WRFUXXED` - Enables emulation of the IS-SPI-USB-ADAPTER to support the WRFUxxed exploit. This requires <code>uartBufv060.bin</code> to be placed in the `data/` folder. **Default: disabled.** Uses pio0 sm1 and fills the remaining pio0 instruction memory, so the PSRAM ROM cache falls back to its bit-banged data path when this is enabled.
+   * `ENABLE_PREVENT_DSI_AUTOBOOT` - Experimental feature that prevents DSi consoles from autobooting when the autoboot flag is set. It was intended to be used with WRFU Tester, which has the autoboot flag set. It is generally not recommended to use this, as it does not work properly with the 3DS and has not been tested much. **Default: disabled.**
+
+Defines set automatically by the build system (do not set these yourself):
+
+   * `DETECT_CONSOLE_TYPE` - Enabled automatically when both `roms/default.nds` and `roms/dsimode.nds` exist. Switches the served rom based on the detected console type.
+   * `PICO_STACK_SIZE` / `PICO_CORE1_STACK_SIZE` - Stack sizes for core0/core1, tuned for this firmware.
 
 ### Setting up the rom(s)
 To compile and properly use the firmware, you will need to place a valid DS rom in the `roms/` folder, named `default.nds`. Additionally, you may include a second rom in the `roms/` folder named `dsimode.nds`, if you wish to have a different rom for DS consoles and DSi/3DS consoles.
@@ -114,6 +124,32 @@ Simply run `./compile.sh` to compile the firmware. Once it is complete, you will
 
 > [!IMPORTANT]
 > The firmware only works correctly when build with optimization. Recommended is `RelWithDebInfo`.
+
+To pass cmake options or use your own pico-sdk checkout, configure and build manually:
+
+```bash
+# configure (set PICO_SDK_PATH if the sdk is not the pico-sdk/ submodule)
+PICO_SDK_PATH=/path/to/pico-sdk \
+    cmake -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo -B build/ .
+
+# build
+PICO_SDK_PATH=/path/to/pico-sdk \
+CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+    cmake --build build
+```
+
+Examples with options (see the CMakeList section above for the full list):
+
+```bash
+# default build: PSRAM ROM cache on, UART logging off
+cmake -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo -B build/ .
+
+# debug build with UART logs on GPIO0/1 (115200 8N1)
+cmake -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo -DENABLE_UART_LOG=ON -B build/ .
+
+# build without the PSRAM ROM cache (e.g. for the stock DSpico board)
+cmake -DCMAKE_BUILD_TYPE:STRING=RelWithDebInfo -DENABLE_PSRAM_ROM_CACHE=OFF -B build/ .
+```
 
 ## License
 
