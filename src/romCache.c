@@ -20,7 +20,7 @@ void romCacheInit(void)
     sHits = 0;
     sMisses = 0;
     sCacheAvailable = psram_init();
-    printf("PSRAM ROM cache: %s (%u KB, %u lines)\n",
+    LOG("PSRAM ROM cache: %s (%u KB, %u lines)\n",
         sCacheAvailable ? "enabled" : "not detected, disabled",
         PSRAM_SIZE_BYTES / 1024, ROM_CACHE_NUM_LINES);
 }
@@ -81,7 +81,7 @@ void romCacheUpdate(void)
     u32 total = sHits + sMisses;
     // hit rate in permille, printed with one decimal
     u32 permille = total != 0 ? (sHits * 1000 + total / 2) / total : 0;
-    printf("ROM cache: hits=%u misses=%u hitrate=%u.%u%%\n",
+    LOG("ROM cache: hits=%u misses=%u hitrate=%u.%u%%\n",
         sHits, sMisses, permille / 10, permille % 10);
 
     sLastPrintedHits = sHits;

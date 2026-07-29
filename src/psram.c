@@ -391,6 +391,6 @@ bool psram_init(void)
             return false;
     }
 
-    printf("PSRAM: %s data path\n", sUsePio ? "PIO" : "bit-bang");
+    LOG("PSRAM: %s data path\n", sUsePio ? "PIO" : "bit-bang");
     return true;
 }

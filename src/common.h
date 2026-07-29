@@ -63,6 +63,15 @@ typedef volatile int64_t vs64;
 
 typedef void (*sd_callback_t)(uint32_t bytes_complete);
 
+// Firmware log output on the debug UART (GPIO0/1). Compiled out unless
+// ENABLE_UART_LOG is defined at build time.
+#ifdef ENABLE_UART_LOG
+#include <stdio.h>
+#define LOG(...)    printf(__VA_ARGS__)
+#else
+#define LOG(...)    ((void)0)
+#endif
+
 static inline uint millis(void)
 {
     return us_to_ms(time_us_64());

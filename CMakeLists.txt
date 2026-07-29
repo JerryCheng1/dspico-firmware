@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
 option(ENABLE_PSRAM_ROM_CACHE "Cache ROM blocks in the external APS6404 PSRAM (GPIO22-26/29)" ON)
+option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
 
 add_compile_definitions(DSpico
   PICO_STACK_SIZE=0x600
@@ -96,10 +97,18 @@ if(ENABLE_PSRAM_ROM_CACHE)
   )
 endif()
 
+if(ENABLE_UART_LOG)
+  target_compile_definitions(DSpico PRIVATE
+    ENABLE_UART_LOG
+  )
+  pico_enable_stdio_uart(DSpico 1)
+else()
+  pico_enable_stdio_uart(DSpico 0)
+endif()
+
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2040_sdio.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
 
-pico_enable_stdio_uart(DSpico 1)
 pico_add_extra_outputs(DSpico)
 target_link_libraries(DSpico pico_stdlib hardware_pio hardware_dma pico_multicore)
