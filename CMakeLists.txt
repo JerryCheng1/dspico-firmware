@@ -41,6 +41,7 @@ add_executable(DSpico
   src/ntrCardRomGameR4.cpp
   src/psram.c
   src/psram.h
+  src/psram.pio
   src/romCache.c
   src/romCache.h
   src/ntrCardRomGameUsb.cpp
@@ -97,6 +98,7 @@ endif()
 
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2040_sdio.pio)
+pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
 
 pico_enable_stdio_uart(DSpico 1)
 pico_add_extra_outputs(DSpico)

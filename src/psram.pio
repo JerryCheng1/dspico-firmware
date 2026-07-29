@@ -1,0 +1,31 @@
+; APS6404L QSPI PSRAM data pump (DSPICOwithPSRAM hardware).
+;
+; Pin mapping:
+; - OUT/IN base: GPIO22 (PSRAM IO0-IO3, 4 pins)
+; - side-set   : GPIO26 (PSRAM SCLK)
+; - CE (GPIO29) and the serial command byte are handled by the CPU via SIO.
+;
+; The X register must be preloaded with the nibble count - 1 by the CPU
+; (via an exec'd `out x, 32`) before enabling the state machine.
+
+; Streams nibbles from the TX FIFO to IO0-IO3. Autopull must be enabled.
+; Data changes while SCLK is low, the PSRAM samples it on the rising edge.
+.program psram_qspi_tx
+.side_set 1 opt
+.wrap_target
+tx_loop:
+    out pins, 4     side 0
+    jmp x-- tx_loop side 1
+.wrap
+
+; Samples nibbles from IO0-IO3 into the RX FIFO. Autopush must be enabled.
+; The PSRAM launches data on the falling edge; sampling at the end of the
+; high phase gives it a full half clock to settle.
+.program psram_qspi_rx
+.side_set 1 opt
+.wrap_target
+rx_loop:
+    nop             side 1
+    in pins, 4      side 0
+    jmp x-- rx_loop side 1
+.wrap
