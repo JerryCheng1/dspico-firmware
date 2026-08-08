@@ -24,6 +24,13 @@ static u32 sMisses;
 // SD mount times out.
 #define ROM_CACHE_TEST_CHUNK_BYTES  512
 
+// The test does not start immediately: each step runs PSRAM bursts with
+// interrupts briefly disabled, and during the first seconds after boot the
+// loader is mounting the SD card over the cart bus - the added IRQ latency
+// breaks that. Give the loader time to finish before testing.
+#define ROM_CACHE_TEST_DELAY_MS     10000
+
+static bool sTestPending;
 static bool sTestRunning;
 static bool sTestWritePhase;
 static u32 sTestAddr;
@@ -86,13 +93,15 @@ void romCacheInit(void)
     sMisses = 0;
     sCacheAvailable = false;
     sTestRunning = false;
+    sTestPending = false;
     if (psram_init())
     {
-        sTestRunning = true;
+        sTestPending = true;
         sTestWritePhase = true;
         sTestAddr = 0;
         sTestStart = millis();
-        LOG("PSRAM: detected, running background full-chip test...\n");
+        LOG("PSRAM: detected, full-chip test starts in %u s...\n",
+            ROM_CACHE_TEST_DELAY_MS / 1000);
     }
     else
     {
@@ -140,6 +149,15 @@ void romCacheStore(u32 blockAddr, const u8* src)
 
 void romCacheUpdate(void)
 {
+    if (sTestPending)
+    {
+        if ((u32)(millis() - sTestStart) < ROM_CACHE_TEST_DELAY_MS)
+            return;
+        sTestPending = false;
+        sTestRunning = true;
+        sTestStart = millis();
+        LOG("PSRAM: running background full-chip test...\n");
+    }
     if (sTestRunning)
         romCacheTestStep();
 
