@@ -32,6 +32,33 @@ static u32 sMisses;
 
 static bool sTestPending;
 static bool sTestRunning;
+
+// The main loop sleeps in __wfi() when the cart bus is idle, so without help
+// the test would only advance when the console happens to send commands (at
+// the launcher menu: never). A repeating timer on TIMER_IRQ_1 (the SD driver
+// owns TIMER_IRQ_0) wakes the loop every 2 ms while the test is pending or
+// running.
+static alarm_pool_t* sWakePool;
+static repeating_timer_t sWakeTimer;
+
+static bool romCacheWakeTick(repeating_timer_t* t)
+{
+    (void)t;
+    return true; // the IRQ itself is the product: it wakes the main loop
+}
+
+static void romCacheWakeTimerStart(void)
+{
+    if (!sWakePool)
+        sWakePool = alarm_pool_create(1, 4);
+    alarm_pool_add_repeating_timer_ms(sWakePool, 2, romCacheWakeTick, NULL, &sWakeTimer);
+}
+
+static void romCacheWakeTimerStop(void)
+{
+    if (sWakePool)
+        cancel_repeating_timer(&sWakeTimer);
+}
 static bool sTestWritePhase;
 static u32 sTestAddr;
 static u32 sTestStart;
@@ -62,6 +89,7 @@ static void romCacheTestStep(void)
                 LOG("PSRAM: full-chip test FAILED @0x%08lX, ROM cache stays disabled\n",
                     sTestAddr + i);
                 sTestRunning = false;
+                romCacheWakeTimerStop();
                 return;
             }
         }
@@ -80,6 +108,7 @@ static void romCacheTestStep(void)
     {
         sTestRunning = false;
         sCacheAvailable = true;
+        romCacheWakeTimerStop();
         LOG("PSRAM: full-chip test OK (%lu ms), ROM cache enabled (%u KB, %u lines)\n",
             (u32)(millis() - sTestStart),
             PSRAM_SIZE_BYTES / 1024, (u32)ROM_CACHE_NUM_LINES);
@@ -100,6 +129,7 @@ void romCacheInit(void)
         sTestWritePhase = true;
         sTestAddr = 0;
         sTestStart = millis();
+        romCacheWakeTimerStart();
         LOG("PSRAM: detected, full-chip test starts in %u s...\n",
             ROM_CACHE_TEST_DELAY_MS / 1000);
     }
@@ -159,7 +189,15 @@ void romCacheUpdate(void)
         LOG("PSRAM: running background full-chip test...\n");
     }
     if (sTestRunning)
-        romCacheTestStep();
+    {
+        // Catch up on missed wakeups: spend at most ~1 ms per call so the
+        // cart protocol stays responsive.
+        u32 until = time_us_32() + 1000;
+        do
+        {
+            romCacheTestStep();
+        } while (sTestRunning && (int)(time_us_32() - until) < 0);
+    }
 
     if (!sCacheAvailable)
         return;
