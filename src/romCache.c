@@ -1,6 +1,7 @@
 #include "common.h"
 #include <stdio.h>
 #include "hardware/structs/scb.h"
+#include "ntrCardRom.h"
 #include "romCache.h"
 
 #ifdef ENABLE_PSRAM_ROM_CACHE
@@ -196,13 +197,30 @@ void romCacheUpdate(void)
     }
     if (sTestRunning)
     {
-        // Catch up on missed wakeups: spend at most ~1 ms per call so the
-        // cart protocol stays responsive.
+        // Only test while the cart bus has been quiet for a while: the test
+        // bursts run with interrupts briefly disabled, and hammering them
+        // while the console is actively sending commands corrupts the cart
+        // protocol (observed as a white screen when using the launcher).
+        static u32 sLastCmdCount;
+        static u32 sIdleSince;
+        u32 now = millis();
+        if (gNtrBusCmdCount != sLastCmdCount)
+        {
+            sLastCmdCount = gNtrBusCmdCount;
+            sIdleSince = now;
+            return;
+        }
+        if ((u32)(now - sIdleSince) < 200)
+            return;
+
+        // Catch up on missed wakeups: spend at most ~1 ms per call, and bail
+        // out of the batch as soon as the bus wakes up.
         u32 until = time_us_32() + 1000;
         do
         {
             romCacheTestStep();
-        } while (sTestRunning && (int)(time_us_32() - until) < 0);
+        } while (sTestRunning && gNtrBusCmdCount == sLastCmdCount &&
+            (int)(time_us_32() - until) < 0);
     }
 
     if (!sCacheAvailable)

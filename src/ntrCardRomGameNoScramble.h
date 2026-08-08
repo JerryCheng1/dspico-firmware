@@ -10,6 +10,7 @@ extern "C" {
 /// @param romEmu The rom emulator context.
 static inline void ntrc_finishGameNoScrambleCmd0(ntr_rom_emu_t* romEmu)
 {
+    gNtrBusCmdCount++;
     romEmu->wordIdx = 1;
 }
 

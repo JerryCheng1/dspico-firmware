@@ -11,6 +11,7 @@ extern "C" {
 /// @param romEmu The rom emulator context.
 static inline void ntrc_finishGameCmd0(ntr_rom_emu_t* romEmu)
 {
+    gNtrBusCmdCount++;
     scr_advanceRing(romEmu, 1); //cmd
     romEmu->wordIdx = 1;
 }

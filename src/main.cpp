@@ -29,6 +29,7 @@ static u32 sProgramOffset;
 FATFS sFatFs;
 SdCard gSdCard;
 static bool sIsSdCardMounted;
+volatile u32 gNtrBusCmdCount;
 
 #ifdef DETECT_CONSOLE_TYPE
 static void setRomToDsiRom(void)
@@ -316,6 +317,13 @@ int __time_critical_func(main)()
     tryRebootToBootsel();
 
     pwr_initPowerSaving();
+
+#ifdef ENABLE_UART_LOG
+    // pwr_initPowerSaving() stops clk_peri, which freezes the debug UART.
+    // Restart it so logs after boot (PSRAM test, cache stats) stay visible.
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+        clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+#endif
 
 #ifdef ENABLE_PSRAM_ROM_CACHE
     // After pwr_initPowerSaving(): the background test's wake timer drops the

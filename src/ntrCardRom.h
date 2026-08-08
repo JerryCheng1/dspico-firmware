@@ -100,6 +100,11 @@ static_assert(offsetof(ntr_rom_emu_t, readDataCompleteHandler) == 0x20, "readDat
 
 extern ntr_rom_emu_t gNtrRomEmu;
 
+// Incremented for every game-mode command (see ntrc_finishGameCmd0 and
+// ntrc_finishGameNoScrambleCmd0). Lets background work such as the PSRAM
+// full-chip test tell whether the cartridge bus is idle.
+extern volatile u32 gNtrBusCmdCount;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
