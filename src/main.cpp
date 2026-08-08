@@ -315,11 +315,13 @@ int __time_critical_func(main)()
 
     tryRebootToBootsel();
 
+    pwr_initPowerSaving();
+
 #ifdef ENABLE_PSRAM_ROM_CACHE
+    // After pwr_initPowerSaving(): the background test's wake timer drops the
+    // core out of deep sleep, and power saving would re-enable it.
     romCacheInit();
 #endif
-
-    pwr_initPowerSaving();
 
     while (1)
     {

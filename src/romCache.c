@@ -1,5 +1,6 @@
 #include "common.h"
 #include <stdio.h>
+#include "hardware/structs/scb.h"
 #include "romCache.h"
 
 #ifdef ENABLE_PSRAM_ROM_CACHE
@@ -52,12 +53,17 @@ static void romCacheWakeTimerStart(void)
     if (!sWakePool)
         sWakePool = alarm_pool_create(1, 4);
     alarm_pool_add_repeating_timer_ms(sWakePool, 2, romCacheWakeTick, NULL, &sWakeTimer);
+    // pwr_initPowerSaving() deep-sleeps with only PIO0 clocked, which stops
+    // the hardware timer; drop to light sleep while the test needs wakeups.
+    // romCacheInit() must therefore run after pwr_initPowerSaving().
+    scb_hw->scr &= ~M0PLUS_SCR_SLEEPDEEP_BITS;
 }
 
 static void romCacheWakeTimerStop(void)
 {
     if (sWakePool)
         cancel_repeating_timer(&sWakeTimer);
+    scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS; // restore deep sleep
 }
 static bool sTestWritePhase;
 static u32 sTestAddr;
