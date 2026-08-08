@@ -13,6 +13,9 @@ add_compile_definitions(DSpico
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
 
+option(ENABLE_PSRAM_ROM_CACHE "Cache ROM blocks in the external APS6404 PSRAM (GPIO22-26/29)" ON)
+option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
+
 add_executable(DSpico
   src/main.cpp
   src/common.h
@@ -74,6 +77,10 @@ add_executable(DSpico
   src/sd/fatfs/ffconf.h
   src/sd/fatfs/ffunicode.c
   src/sd/fatfs/ffsystem.c
+  src/psram.c
+  src/psram.h
+  src/romCache.c
+  src/romCache.h
 )
 
 if(EXISTS "${CMAKE_SOURCE_DIR}/roms/default.nds" AND EXISTS "${CMAKE_SOURCE_DIR}/roms/dsimode.nds")
@@ -82,9 +89,24 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/default.nds" AND EXISTS "${CMAKE_SOURCE_DIR}
   )
 endif()
 
+if(ENABLE_PSRAM_ROM_CACHE)
+  target_compile_definitions(DSpico PRIVATE
+    ENABLE_PSRAM_ROM_CACHE
+  )
+endif()
+
+if(ENABLE_UART_LOG)
+  target_compile_definitions(DSpico PRIVATE
+    ENABLE_UART_LOG
+  )
+  pico_enable_stdio_uart(DSpico 1)
+else()
+  pico_enable_stdio_uart(DSpico 0)
+endif()
+
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2040_sdio.pio)
+pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
 
-pico_enable_stdio_uart(DSpico 1)
 pico_add_extra_outputs(DSpico)
 target_link_libraries(DSpico pico_stdlib hardware_pio hardware_dma pico_multicore)

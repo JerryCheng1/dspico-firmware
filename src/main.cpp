@@ -20,6 +20,10 @@
 #include "pico/bootrom.h"
 #include "hardware/xosc.h"
 #include "powerSaving.h"
+#ifdef ENABLE_PSRAM_ROM_CACHE
+#include "psram.h"
+#include "romCache.h"
+#endif
 
 static u32 sProgramOffset;
 FATFS sFatFs;
@@ -155,6 +159,7 @@ static void tryRebootToBootsel(void)
 {
     if (!sIsSdCardMounted)
     {
+        LOG("[BOOT] no SD card mounted, rebooting to BOOTSEL (USB flash mode)\n");
         xosc_init();
         reset_usb_boot(0, 0);
     }
@@ -285,11 +290,34 @@ int __time_critical_func(main)()
     // printf("Starting\n");
     // printf("sProgramOffset %d\n", sProgramOffset);
     // printf("Boot time %d\n", (u32)bootTime);
+
+#ifdef ENABLE_UART_LOG
+    // Debug UART on GPIO0/1, which the init above does not touch.
+    stdio_init_all();
+#endif
+
+    // Boot banner: the very first thing on the wire. If this does not show
+    // up, the problem is UART wiring/baud, not the firmware.
+    LOG("\n[BOOT] DSpico firmware up, sysclk=%lu MHz, UART log OK\n",
+        (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+    LOG("[BOOT] PSRAM ROM cache: %s\n",
+    #ifdef ENABLE_PSRAM_ROM_CACHE
+        "compiled in"
+    #else
+        "not compiled"
+    #endif
+    );
+
     resetNtrCard();
     sIsSdCardMounted = false;
     initSd();
+    LOG("[BOOT] SD card: %s\n", sIsSdCardMounted ? "mounted" : "not mounted");
 
     tryRebootToBootsel();
+
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    romCacheInit();
+#endif
 
     pwr_initPowerSaving();
 
@@ -299,6 +327,9 @@ int __time_critical_func(main)()
         gSdCard.Update();
     #ifdef ENABLE_R4_MODE
         ntrc_gameR4Update();
+    #endif
+    #ifdef ENABLE_PSRAM_ROM_CACHE
+        romCacheUpdate();
     #endif
         __wfi();
     }

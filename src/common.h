@@ -48,6 +48,7 @@ typedef volatile int64_t vs64;
 
 #define PIN_DEV_TX0     0
 #define PIN_DEV_RX0     1
+#define DEV_UART_PIN_MASK  ((1u << PIN_DEV_RX0) | (1u << PIN_DEV_TX0))
 
 #define PIN_INPUT_MASK  0x2FFE00
 
@@ -55,6 +56,15 @@ typedef volatile int64_t vs64;
 #define CARD_ID_TWL     0xC00000C2
 
 typedef void (*sd_callback_t)(uint32_t bytes_complete);
+
+// Firmware log output on the debug UART (GPIO0/1). Compiled out unless
+// ENABLE_UART_LOG is defined at build time.
+#ifdef ENABLE_UART_LOG
+#include <stdio.h>
+#define LOG(...)    printf(__VA_ARGS__)
+#else
+#define LOG(...)    ((void)0)
+#endif
 
 static inline uint millis(void)
 {
