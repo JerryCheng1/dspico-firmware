@@ -44,8 +44,6 @@ typedef volatile int64_t vs64;
 #define PIN_IRQ     20
 #define PIN_CS2     21
 
-#define PIN_USB_VBUS    24
-
 #define PIN_DEV_TX0     0
 #define PIN_DEV_RX0     1
 #define DEV_UART_PIN_MASK  ((1u << PIN_DEV_RX0) | (1u << PIN_DEV_TX0))

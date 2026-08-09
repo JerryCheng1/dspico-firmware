@@ -41,12 +41,6 @@ typedef enum
 #define WRITE_SD_DATA_IS_LAST_FLAG          1
 #define WRITE_SD_DATA_FLAGS_MASK            (WRITE_SD_DATA_IS_FIRST_FLAG | WRITE_SD_DATA_IS_LAST_FLAG)
 
-// custom game mode commands for USB
-#define NTR_CMD_ID_GAME_USB_COMMAND         0xE8
-#define NTR_CMD_ID_GAME_USB_WRITE_DATA      0xE9
-#define NTR_CMD_ID_GAME_USB_READ_DATA       0xEA
-#define NTR_CMD_ID_GAME_USB_GET_EVENT       0xEB
-
 struct ntr_rom_emu_t;
 
 typedef void (*ntrc_cmd_handler_t)(struct ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio);

@@ -39,24 +39,6 @@ add_executable(DSpico
   src/ntrCardRomGameNoScramble.h
   src/ntrCardRomGameSd.cpp
   src/ntrCardRomGameR4.cpp
-  src/ntrCardRomGameUsb.cpp
-  src/ntrCardRomGameUsb.h
-  src/usbEventQueue.c
-  src/usbEventQueue.h
-  src/tinyusb/dcd_rp2040.c
-  src/tinyusb/rp2040_usb.c
-  src/tinyusb/rp2040_usb.h
-  src/tinyusb/dcd.h
-  src/tinyusb/tusb_option.h
-  src/tinyusb/tusb_compiler.h
-  src/tinyusb/tusb_common.h
-  src/tinyusb/tusb_config.h
-  src/tinyusb/tusb_mcu.h
-  src/tinyusb/tusb_verify.h
-  src/tinyusb/tusb_types.h
-  src/tinyusb/tusb_debug.h
-  src/tinyusb/osal.h
-  src/tinyusb/osal_none.h
   src/ntrCardSpiUart.c
   src/ntrCardSpiUart.h
   src/wrfuxxed.h

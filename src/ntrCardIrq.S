@@ -197,9 +197,9 @@ gGameNoScrambleCmd0HandlerTable:
     .word ntrc_gameNoScrambleCmd0Dummy //E6
     .word ntrc_gameNoScrambleCmd0Dummy //E7
     .word ntrc_gameNoScrambleCmd0Dummy //E8
-    .word ntrc_gameWriteUsbDataCmd0 //E9
-    .word ntrc_gameReadUsbDataCmd0 //EA
-    .word ntrc_gameUsbGetEventCmd0 //EB
+    .word ntrc_gameNoScrambleCmd0Dummy //E9
+    .word ntrc_gameNoScrambleCmd0Dummy //EA
+    .word ntrc_gameNoScrambleCmd0Dummy //EB
     .word ntrc_gameNoScrambleCmd0Dummy //EC
     .word ntrc_gameNoScrambleCmd0Dummy //ED
     .word ntrc_gameNoScrambleCmd0Dummy //EE
@@ -311,10 +311,10 @@ gGameNoScrambleCmd1HandlerTable:
     .word ntrc_gameGetSdDataCmd1 //E5
     .word ntrc_gameNoScrambleCmd1Unknown //E6
     .word ntrc_gameNoScrambleCmd1Unknown //E7
-    .word ntrc_gameReqUsbCommandCmd1 //E8
-    .word ntrc_gameWriteUsbDataCmd1 //E9
-    .word ntrc_gameReadUsbDataCmd1 //EA
-    .word ntrc_gameUsbGetEventCmd1 //EB
+    .word ntrc_gameNoScrambleCmd1Unknown //E8
+    .word ntrc_gameNoScrambleCmd1Unknown //E9
+    .word ntrc_gameNoScrambleCmd1Unknown //EA
+    .word ntrc_gameNoScrambleCmd1Unknown //EB
     .word ntrc_gameNoScrambleCmd1Unknown //EC
     .word ntrc_gameNoScrambleCmd1Unknown //ED
     .word ntrc_gameNoScrambleCmd1Unknown //EE

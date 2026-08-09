@@ -17,7 +17,6 @@
 #include "r4.h"
 #include "sd/SdCard.h"
 #include "scramblerRing.h"
-#include "pico/bootrom.h"
 #include "hardware/xosc.h"
 #include "powerSaving.h"
 #ifdef ENABLE_PSRAM_ROM_CACHE
@@ -41,7 +40,6 @@ static void setRomToDsiRom(void)
 
 static void resetNtrCard(void)
 {
-    ntrc_resetUsb();
     pwr_disableAfterBootPowerSaving();
     ntrc_setNormalMode();
     gNtrRomEmu.securePhase1 = false;
@@ -160,9 +158,12 @@ static void tryRebootToBootsel(void)
 {
     if (!sIsSdCardMounted)
     {
-        LOG("[BOOT] no SD card mounted, rebooting to BOOTSEL (USB flash mode)\n");
-        xosc_init();
-        reset_usb_boot(0, 0);
+        // No USB hardware on this board, so BOOTSEL (USB mass-storage) flashing
+        // is not possible. Halt so the failure is observable on the log UART
+        // instead of silently rebooting into a useless BOOTSEL mode.
+        LOG("[BOOT] no SD card mounted, halting (no USB to BOOTSEL-flash)\n");
+        while (1)
+            __wfi();
     }
 }
 
@@ -284,7 +285,6 @@ int __time_critical_func(main)()
     irq_init_priorities();
     irq_set_priority(PIO0_IRQ_0, 0x40);
     irq_set_priority(IO_IRQ_BANK0, 0x40);
-    irq_set_priority(USBCTRL_IRQ, 0x80);
     irq_set_priority(DMA_IRQ_1, 0x80);
     irq_set_priority(TIMER_IRQ_0, 0x80);
 
