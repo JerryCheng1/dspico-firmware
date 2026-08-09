@@ -391,6 +391,25 @@ bool romCacheCore1Poll(void)
 #endif
 }
 
+// Count SD cache lines currently holding a valid sector (tag != invalid).
+// Runs on the main loop every heartbeat (512 reads, trivial). Used to report
+// PSRAM usage / free space for the active SD sector cache.
+static u32 romCacheSdUsedLines(void)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < SD_CACHE_NUM_LINES; i++)
+        if (sSdTags[i] != 0xFFFFFFFF)
+            n++;
+    return n;
+}
+
+// Hit rate as permille (0..1000) so it can be printed as N.N%.
+static u32 hitRatePermille(u32 hits, u32 misses)
+{
+    u32 total = hits + misses;
+    return total != 0 ? (hits * 1000 + total / 2) / total : 0;
+}
+
 // core0: forward core1's probe/test outcome to logs and cache state.
 void romCacheUpdate(void)
 {
@@ -409,15 +428,30 @@ void romCacheUpdate(void)
     // because the main loop only runs when an IRQ wakes it (PIO0_IRQ_0 on each
     // cart read), which can be only a few times/sec once a game runs from NDS
     // RAM - a tick counter would take hours to fire.
+    //
+    // Two caches share the PSRAM:
+    //  - SD  : 512B/line sector cache on the E3/E5 read path. ACTIVE under
+    //          pico-loader (its hits/misses grow as it re-reads FAT/dir/etc.).
+    //          Capacity = 512 lines * 512B = 256 KB of the 8 MB PSRAM.
+    //  - ROM : 16KB/line block cache on the B6 ROM-read path. DORMANT under
+    //          pico-loader (it never issues B6), so hits/misses stay 0/0.
     extern volatile u32 sSdHits, sSdMisses;
     static u64 sBeatLastUs;
     u64 beatNow = time_us_64();
     if (beatNow - sBeatLastUs >= 3000000)
     {
         sBeatLastUs = beatNow;
-        LOG("cache beat: avail=%d rom h/m=%u/%u sd h/m=%u/%u\n",
-            (int)sCacheAvailable, (u32)sHits, (u32)sMisses,
-            (u32)sSdHits, (u32)sSdMisses);
+
+        u32 sdRate = hitRatePermille(sSdHits, sSdMisses);
+        u32 usedLines = romCacheSdUsedLines();
+        u32 capKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024; // 256 KB
+        u32 usedKb = (usedLines * SD_CACHE_LINE_SIZE) / 1024;
+        u32 freeKb = capKb - usedKb;
+        u32 romRate = hitRatePermille(sHits, sMisses);
+        LOG("[cache] SD hit=%u miss=%u rate=%u.%u%% | used=%u/%u lines (%uKB) free=%uKB/%uKB | ROM hit=%u miss=%u rate=%u.%u%%\n",
+            (u32)sSdHits, (u32)sSdMisses, sdRate / 10, sdRate % 10,
+            usedLines, (u32)SD_CACHE_NUM_LINES, usedKb, freeKb, capKb,
+            (u32)sHits, (u32)sMisses, romRate / 10, romRate % 10);
     }
 
     static bool sLoggedProbe;
@@ -428,12 +462,12 @@ void romCacheUpdate(void)
 #if PSRAM_FULL_CHIP_TEST
             LOG("PSRAM: detected, full-chip test running on core1...\n");
 #elif PSRAM_CACHE_ENABLE_ON_PROBE
-            LOG("PSRAM: detected, enabling ROM cache on core1...\n");
+            LOG("PSRAM: detected, probing on core1...\n");
 #else
             LOG("PSRAM: detected (probe OK), cache NOT enabled (diagnostic)\n");
 #endif
         else
-            LOG("PSRAM ROM cache: not detected, disabled\n");
+            LOG("PSRAM: not detected, cache disabled\n");
     }
     if (sCacheAvailable)
     {
@@ -441,41 +475,18 @@ void romCacheUpdate(void)
         if (!sLoggedOk)
         {
             sLoggedOk = true;
-#if PSRAM_FULL_CHIP_TEST
-            LOG("PSRAM: full-chip test OK (%lu ms), ROM cache enabled (%u KB, %u lines)\n",
-                (u32)(millis() - sTestStart),
-                PSRAM_SIZE_BYTES / 1024, (u32)ROM_CACHE_NUM_LINES);
-#else
-            LOG("PSRAM: probe OK (%lu ms), ROM cache enabled (%u KB, %u lines)\n",
-                (u32)(millis() - sTestStart),
-                PSRAM_SIZE_BYTES / 1024, (u32)ROM_CACHE_NUM_LINES);
-#endif
-        }
-
-        // Print hit/miss stats when they change. The first change prints
-        // immediately: the main loop is __wfi-driven and goes quiet once a
-        // game runs from NDS RAM, so a pure 5 s timer can be missed entirely
-        // (the stats change during the sub-5 s load, then the loop stops
-        // running before the 5 s mark). After the first print, rate-limit to
-        // once every 5 s.
-        static u32 sLastPrintedHits = 0;
-        static u32 sLastPrintedMisses = 0;
-        static u64 sLastPrintTime = 0;
-        static bool sFirstStatPrint = true;
-        if (sHits != sLastPrintedHits || sMisses != sLastPrintedMisses)
-        {
-            u64 now = time_us_64();
-            if (sFirstStatPrint || now - sLastPrintTime >= 5000000)
-            {
-                sFirstStatPrint = false;
-                u32 total = sHits + sMisses;
-                u32 permille = total != 0 ? (sHits * 1000 + total / 2) / total : 0;
-                LOG("ROM cache: hits=%u misses=%u hitrate=%u.%u%%\n",
-                    sHits, sMisses, permille / 10, permille % 10);
-                sLastPrintedHits = sHits;
-                sLastPrintedMisses = sMisses;
-                sLastPrintTime = now;
-            }
+            // One-time summary of what the cache uses and how to read the
+            // heartbeat. The SD cache is the one pico-loader exercises.
+            u32 sdCapKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024;
+            LOG("PSRAM: probe OK (%lu ms), %u KB chip\n",
+                (u32)(millis() - sTestStart), PSRAM_SIZE_BYTES / 1024);
+            LOG("PSRAM: cache enabled - SD %u lines x %uB = %uKB (E3/E5 sector cache, ACTIVE)"
+                " | ROM %u lines x %uKB = %uKB (B6 block cache, dormant under pico-loader)\n",
+                (u32)SD_CACHE_NUM_LINES, (u32)SD_CACHE_LINE_SIZE, sdCapKb,
+                (u32)ROM_CACHE_NUM_LINES, (u32)(ROM_CACHE_LINE_SIZE / 1024),
+                PSRAM_SIZE_BYTES / 1024);
+            LOG("[cache] legend: SD hit/miss=E3/E5 sector cache; ROM hit/miss=B6 block cache; "
+                "used=valid SD lines; rate=hit/(hit+miss)\n");
         }
     }
     else if (sTestFailed)
@@ -484,7 +495,7 @@ void romCacheUpdate(void)
         if (!sLoggedFail)
         {
             sLoggedFail = true;
-            LOG("PSRAM: full-chip test FAILED @0x%08lX, ROM cache stays disabled\n",
+            LOG("PSRAM: full-chip test FAILED @0x%08lX, cache stays disabled\n",
                 (u32)sTestFailAddr);
         }
     }
