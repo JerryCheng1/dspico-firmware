@@ -3,8 +3,13 @@
 Debug/
 Release/
 build/
+build-*/
 cmake-build*/
 out/
+
+# Claude Code session data #
+############################
+.claude/
 
 # Compiled source #
 ###################

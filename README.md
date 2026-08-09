@@ -1,16 +1,15 @@
 # DSpico Firmware
-This is the repository for the DSpico firmware. The firmware emulates a DS cartridge, with extended features for SD access and USB. PIO is used for an SDIO interface for the SD card and for interfacing the DS cartridge bus.
+This is the repository for the DSpico firmware. The firmware emulates a DS cartridge, with extended features for SD access. PIO is used for an SDIO interface for the SD card and for interfacing the DS cartridge bus.
 
 For an overview of the supported card commands, see [commands.md](docs/commands.md).
 
 ## Features
 - Emulates a retail DS(i) cartridge
 - Interfaces with an SD card using SDIO and exposes card commands to access it from the DS side
-- Exposes card commands to the DS side to allow interfacing with the USB port of the RP2040
 - Can emulate an R4 to support software such as the Wood R4 kernel
 - Supports having a separate rom for DS and DSi/3DS systems
 - Supports emulating the IS-SPI-USB-ADAPTER for the WRFUxxed exploit
-- Easy updating; starting the firmware with an ejected SD card reboots to BOOTSEL
+- Optional ROM/SD sector cache in external APS6404 PSRAM, speeding up repeated reads (e.g. the loader's FAT/directory sectors)
 - Optimized for minimal power use when idle
 
 ## Pinout
@@ -35,6 +34,12 @@ For an overview of the supported card commands, see [commands.md](docs/commands.
 |             | DAT2                  | GPIO07            |
 |             | DAT3                  | GPIO08            |
 |             | CMD                   | GPIO04            |
+| **PSRAM**   | IO0                   | GPIO22            |
+|             | IO1                   | GPIO23            |
+|             | IO2                   | GPIO24            |
+|             | IO3                   | GPIO25            |
+|             | SCLK                  | GPIO26            |
+|             | CE                    | GPIO29            |
 
 ## Setup & configuration
 We recommend using WSL (Windows Subsystem for Linux), or a Unix-based machine to compile this repository.
@@ -51,13 +56,29 @@ The steps provided will assume a Linux environment. Alternatively, you can run t
     ```
     Note that you shouldn't use `--recursive` because it draws in a lot of unnecessary submodules inside the pico-sdk.
 
-### CMakeList
-The `CMakeList.txt` file contains a couple of options that you can configure.
+### CMake options & compile-time defines
+The firmware is configured through CMake `option()`s (set on the `cmake` command line with `-D`, e.g. `-DENABLE_UART_LOG=ON`) and a few `add_compile_definitions` / `#ifndef`-guarded macros. The CMake options are read from `CMakeLists.txt`; the source-level switches have sensible defaults and rarely need changing.
 
-   * `ENABLE_R4_MODE` - Enables R4 emulation. This allows you to use R4 software, such as the Wood R4 kernel. As R4 emulation can be used together with regular DSpico software, it can usually be kept enabled.
+#### CMake options (`CMakeLists.txt`)
+   * `ENABLE_R4_MODE` *(on by default)* - Enables R4 emulation. This allows you to use R4 software, such as the Wood R4 kernel. As R4 emulation can be used together with regular DSpico software, it can usually be kept enabled.
       * Note that to be able to use R4 software, your SD card must be at most 4 GB, or have a single partition in the first 4 GB of the SD card. R4 card commands cannot address SD sectors above 4 GB!
-   * `DSPICO_ENABLE_WRFUXXED` - Enables emulation of the IS-SPI-USB-ADAPTER to support the WRFUxxed exploit. This requires <code>uartBufv060.bin</code> to be placed in the `data/` folder.
-   * `ENABLE_PREVENT_DSI_AUTOBOOT` - Experimental feature that prevents DSi consoles from autobooting when the autoboot flag is set. It was intended to be used with WRFU Tester, which has the autoboot flag set. It is generally not recommended to use this, as it does not work properly with the 3DS and has not been tested much.
+   * `ENABLE_PSRAM_ROM_CACHE` *(on by default)* - Builds in the external APS6404L PSRAM ROM/SD cache. Requires the PSRAM fitted on GPIO22-26/29. The cache sits on the E3/E5 SD-sector read path used by pico-loader (see the source-level switches below). Turn off for a build that never touches the PSRAM.
+   * `ENABLE_UART_LOG` *(off by default)* - Prints firmware logs (boot messages, PSRAM probe, cache hit/miss stats) on the debug UART at GPIO0/1. Logs cost some CPU and keep the power-saving clock changes off, so leave it off for daily-use builds.
+   * `DSPICO_ENABLE_WRFUXXED` *(commented out in CMakeLists.txt)* - Enables emulation of the IS-SPI-USB-ADAPTER to support the WRFUxxed exploit. This requires <code>uartBufv060.bin</code> to be placed in the `data/` folder. Enable by uncommenting the line in `add_compile_definitions`.
+   * `ENABLE_PREVENT_DSI_AUTOBOOT` *(commented out)* - Experimental feature that prevents DSi consoles from autobooting when the autoboot flag is set. It was intended to be used with WRFU Tester, which has the autoboot flag set. It is generally not recommended to use this, as it does not work properly with the 3DS and has not been tested much.
+   * `DETECT_CONSOLE_TYPE` *(auto)* - Set automatically when both `roms/default.nds` and `roms/dsimode.nds` are present, enabling the firmware to switch the rom based on which console is detected. You shouldn't change this manually.
+
+#### Stack sizes (`add_compile_definitions`)
+   * `PICO_STACK_SIZE=0x600` - core0 stack.
+   * `PICO_CORE1_STACK_SIZE=0x400` - core1 stack.
+
+#### PSRAM / cache source-level switches (`src/psram.c`, `src/romCache.c`)
+These are `#ifndef`-guarded, so override them with `-D` on the `cmake` command line (or in `CMakeLists.txt`) only if you need a non-default behaviour. Defaults reflect the working, tested configuration.
+   * `PSRAM_FORCE_BITBANG` *(default `1`)* - Forces the PSRAM data path to bit-bang (pure SIO). The PIO pump (`psram_qspi_tx/rx` on pio0 SM2/SM3) is faster (~8 us vs ~64 us per 512 B) but its spinlock disables core0 IRQs across each burst, which blacks out the cartridge bus IRQ and breaks the loader's SD mount. The bit-bang path takes no lock, so it is safe on core0. The PIO pump is still used for the core1 PSRAM probe (disabling core1 IRQs is harmless). Set to `0` to use the PIO pump everywhere - only safe if no PSRAM access runs on core0.
+   * `SD_CACHE_ENABLE` *(default `1`)* - Gates the SD-sector cache **hit** path (E3 tag check + async fill). Set to `0` to disable cache reads while keeping backfill, for isolating which path is in use.
+   * `SD_CACHE_STORE` *(default `1`)* - Gates the SD-sector cache **backfill** path (E5 queues a sector, the main loop writes it to PSRAM). Set to `0` to disable caching of newly read sectors.
+   * `PSRAM_CACHE_ENABLE_ON_PROBE` *(default `1`)* - When `1`, a successful core1 PSRAM probe immediately enables the cache. When `0`, the probe still runs (confirming the PSRAM is present) but the cache stays disabled - ROM/SD is served purely from the SD card, identical to an `ENABLE_PSRAM_ROM_CACHE=OFF` build. Useful for isolating whether a problem comes from the probe bursts or from cache use.
+   * `PSRAM_FULL_CHIP_TEST` *(default `0`)* - When `1`, core1 runs an 8 MB write+verify full-chip test after the probe before enabling the cache, one chunk per scrambler-idle slot. Off by default: its continuous bursts run during gameplay and break the R4 B6 streaming read, and the probe already validates the data path. Leave off.
 
 ### Setting up the rom(s)
 To compile and properly use the firmware, you will need to place a valid DS rom in the `roms/` folder, named `default.nds`. Additionally, you may include a second rom in the `roms/` folder named `dsimode.nds`, if you wish to have a different rom for DS consoles and DSi/3DS consoles.
