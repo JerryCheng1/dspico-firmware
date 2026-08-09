@@ -6,10 +6,7 @@
 #include "ntrCardRom.h"
 #include "romCache.h"
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
-
-static_assert((ROM_CACHE_NUM_LINES & (ROM_CACHE_NUM_LINES - 1)) == 0,
-    "ROM_CACHE_NUM_LINES must be a power of two");
+#ifdef ENABLE_PSRAM_CACHE
 
 // When 1, core1 runs an 8 MB write+verify full-chip test after the probe
 // before enabling the cache. The test's continuous bursts run during gameplay
@@ -23,11 +20,11 @@ static_assert((ROM_CACHE_NUM_LINES & (ROM_CACHE_NUM_LINES - 1)) == 0,
 
 // When 1 (and PSRAM_FULL_CHIP_TEST is 0), a successful probe immediately
 // enables the cache. When 0, the probe still runs (confirming the PSRAM is
-// present and the data path works) but sCacheAvailable stays false, so
-// romCacheFetch/Store are no-ops and ROM is served purely from SD -
-// identical to the nopsram build. This isolates whether breakage comes from
-// the probe bursts / core1 activity (breaks even at 0) or from cache use
-// (only breaks at 1). Default 1 = cache enabled on probe success.
+// present and the data path works) but sCacheAvailable stays false, so the SD
+// cache stays disabled and every sector is served from SD - identical to the
+// nopsram build. This isolates whether breakage comes from the probe bursts /
+// core1 activity (breaks even at 0) or from cache use (only breaks at 1).
+// Default 1 = cache enabled on probe success.
 //
 // The earlier "undefined instruction" on game entry with this at 0 was NOT
 // cache use - it was a race between core0's USB PIN_IRQ toggle
@@ -39,12 +36,10 @@ static_assert((ROM_CACHE_NUM_LINES & (ROM_CACHE_NUM_LINES - 1)) == 0,
 #define PSRAM_CACHE_ENABLE_ON_PROBE 1
 #endif
 
-// Direct mapped cache: block address b goes to line (b >> 14) % NUM_LINES,
-// the line data lives at PSRAM offset lineIdx * 16 KB.
+// sCacheAvailable gates the SD sector cache (the only cache layer): until the
+// core1 probe passes, romCacheSdCheckHit/Store are no-ops and every E3/E5 is
+// served from the SD card directly.
 static volatile bool sCacheAvailable;
-static u32 sTags[ROM_CACHE_NUM_LINES];
-static u32 sHits;
-static u32 sMisses;
 
 // The PSRAM probe + full-chip test run on core1 (see romCacheCore1Poll),
 // keeping the IRQ-shielded/locking bursts off core0's cart-protocol path.
@@ -80,9 +75,6 @@ static inline u8 romCacheTestPattern(u32 addr)
 
 void romCacheInit(void)
 {
-    romCacheInvalidate();
-    sHits = 0;
-    sMisses = 0;
     sCacheAvailable = false;
     sProbeDone = false;
     sProbeOk = false;
@@ -105,39 +97,6 @@ void romCacheInit(void)
 bool romCacheIsAvailable(void)
 {
     return sCacheAvailable;
-}
-
-void romCacheInvalidate(void)
-{
-    for (u32 i = 0; i < ROM_CACHE_NUM_LINES; i++)
-        sTags[i] = 0xFFFFFFFF;
-}
-
-bool romCacheFetch(u32 blockAddr, u8* dst)
-{
-    if (!sCacheAvailable)
-        return false;
-
-    u32 lineIdx = (blockAddr >> ROM_CACHE_LINE_SHIFT) & (ROM_CACHE_NUM_LINES - 1);
-    if (sTags[lineIdx] != blockAddr)
-    {
-        sMisses++;
-        return false;
-    }
-
-    psram_read(lineIdx * ROM_CACHE_LINE_SIZE, dst, ROM_CACHE_LINE_SIZE);
-    sHits++;
-    return true;
-}
-
-void romCacheStore(u32 blockAddr, const u8* src)
-{
-    if (!sCacheAvailable)
-        return;
-
-    u32 lineIdx = (blockAddr >> ROM_CACHE_LINE_SHIFT) & (ROM_CACHE_NUM_LINES - 1);
-    psram_write(lineIdx * ROM_CACHE_LINE_SIZE, src, ROM_CACHE_LINE_SIZE);
-    sTags[lineIdx] = blockAddr;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,15 +294,15 @@ bool romCacheCore1Poll(void)
 #elif PSRAM_CACHE_ENABLE_ON_PROBE
             // Probe validated the data path (write+read+compare at 3
             // addresses with retries). Skip the full-chip test - its
-            // continuous bursts run during gameplay and break the R4 B6
-            // streaming read - and enable the cache on probe success alone.
+            // continuous bursts run during gameplay and break the cart
+            // protocol - and enable the cache on probe success alone.
             sCacheAvailable = true;
 #else
             // Diagnostic: probe ran (PSRAM confirmed present) but the cache
-            // is NOT enabled. romCacheFetch/Store stay no-ops, so the R4 B6
-            // path serves ROM purely from SD - identical to the nopsram build.
-            // If the menu/game still breaks with this, the culprit is the
-            // probe bursts themselves (or core1's activity), not cache use.
+            // is NOT enabled. The SD cache stays disabled, so every sector is
+            // served from SD - identical to the nopsram build. If the
+            // menu/game still breaks with this, the culprit is the probe
+            // bursts themselves (or core1's activity), not cache use.
 #endif
         }
         return true;
@@ -392,8 +351,8 @@ bool romCacheCore1Poll(void)
 }
 
 // Count SD cache lines currently holding a valid sector (tag != invalid).
-// Runs on the main loop every heartbeat (512 reads, trivial). Used to report
-// PSRAM usage / free space for the active SD sector cache.
+// Runs on the main loop every heartbeat (16384 reads, still trivial). Used to
+// report PSRAM usage / free space for the SD sector cache.
 static u32 romCacheSdUsedLines(void)
 {
     u32 n = 0;
@@ -429,12 +388,9 @@ void romCacheUpdate(void)
     // cart read), which can be only a few times/sec once a game runs from NDS
     // RAM - a tick counter would take hours to fire.
     //
-    // Two caches share the PSRAM:
-    //  - SD  : 512B/line sector cache on the E3/E5 read path. ACTIVE under
-    //          pico-loader (its hits/misses grow as it re-reads FAT/dir/etc.).
-    //          Capacity = 512 lines * 512B = 256 KB of the 8 MB PSRAM.
-    //  - ROM : 16KB/line block cache on the B6 ROM-read path. DORMANT under
-    //          pico-loader (it never issues B6), so hits/misses stay 0/0.
+    // The SD sector cache is the only cache layer: 512 B/line, 16384 lines,
+    // filling the whole 8 MB PSRAM. ACTIVE under pico-loader (its hits/misses
+    // grow as it re-reads FAT/dir/font/etc.).
     extern volatile u32 sSdHits, sSdMisses;
     static u64 sBeatLastUs;
     u64 beatNow = time_us_64();
@@ -444,14 +400,12 @@ void romCacheUpdate(void)
 
         u32 sdRate = hitRatePermille(sSdHits, sSdMisses);
         u32 usedLines = romCacheSdUsedLines();
-        u32 capKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024; // 256 KB
+        u32 capKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024; // 8 MB
         u32 usedKb = (usedLines * SD_CACHE_LINE_SIZE) / 1024;
         u32 freeKb = capKb - usedKb;
-        u32 romRate = hitRatePermille(sHits, sMisses);
-        LOG("[cache] SD hit=%u miss=%u rate=%u.%u%% | used=%u/%u lines (%uKB) free=%uKB/%uKB | ROM hit=%u miss=%u rate=%u.%u%%\n",
+        LOG("[cache] SD hit=%u miss=%u rate=%u.%u%% | used=%u/%u lines (%uKB) free=%uKB/%uKB\n",
             (u32)sSdHits, (u32)sSdMisses, sdRate / 10, sdRate % 10,
-            usedLines, (u32)SD_CACHE_NUM_LINES, usedKb, freeKb, capKb,
-            (u32)sHits, (u32)sMisses, romRate / 10, romRate % 10);
+            usedLines, (u32)SD_CACHE_NUM_LINES, usedKb, freeKb, capKb);
     }
 
     static bool sLoggedProbe;
@@ -476,17 +430,13 @@ void romCacheUpdate(void)
         {
             sLoggedOk = true;
             // One-time summary of what the cache uses and how to read the
-            // heartbeat. The SD cache is the one pico-loader exercises.
+            // heartbeat. The SD cache is the only layer; it fills the PSRAM.
             u32 sdCapKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024;
             LOG("PSRAM: probe OK (%lu ms), %u KB chip\n",
                 (u32)(millis() - sTestStart), PSRAM_SIZE_BYTES / 1024);
-            LOG("PSRAM: cache enabled - SD %u lines x %uB = %uKB (E3/E5 sector cache, ACTIVE)"
-                " | ROM %u lines x %uKB = %uKB (B6 block cache, dormant under pico-loader)\n",
-                (u32)SD_CACHE_NUM_LINES, (u32)SD_CACHE_LINE_SIZE, sdCapKb,
-                (u32)ROM_CACHE_NUM_LINES, (u32)(ROM_CACHE_LINE_SIZE / 1024),
-                PSRAM_SIZE_BYTES / 1024);
-            LOG("[cache] legend: SD hit/miss=E3/E5 sector cache; ROM hit/miss=B6 block cache; "
-                "used=valid SD lines; rate=hit/(hit+miss)\n");
+            LOG("PSRAM: SD cache enabled - %u lines x %uB = %uKB (E3/E5 sector cache, fills chip)\n",
+                (u32)SD_CACHE_NUM_LINES, (u32)SD_CACHE_LINE_SIZE, sdCapKb);
+            LOG("[cache] legend: SD hit/miss=E3/E5 sector cache; used=valid lines; rate=hit/(hit+miss)\n");
         }
     }
     else if (sTestFailed)

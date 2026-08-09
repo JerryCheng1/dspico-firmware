@@ -19,7 +19,7 @@
 #include "scramblerRing.h"
 #include "hardware/xosc.h"
 #include "powerSaving.h"
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
 #include "psram.h"
 #include "romCache.h"
 #endif
@@ -60,7 +60,7 @@ static void resetNtrCard(void)
     // SM0 ctrl read-modify-writes must be serialized against core1's PSRAM
     // SM2/SM3 ctrl writes (pio_sm_set_enabled/restart do RMW on pio->ctrl).
     // Take the PSRAM pio0 spinlock; core1 will finish its burst and yield.
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     uint32_t pioLock = psramPioLock();
 #endif
     pio_sm_set_enabled(pio0, 0, false);
@@ -72,7 +72,7 @@ static void resetNtrCard(void)
     irq_set_enabled(PIO0_IRQ_0, true);
     pio_sm_exec(pio0, 0, pio_encode_jmp(sProgramOffset));
     pio_sm_set_enabled(pio0, 0, true);
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     psramPioUnlock(pioLock);
 #endif
 #ifdef DETECT_CONSOLE_TYPE  
@@ -97,12 +97,12 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
     {
         if (events & GPIO_IRQ_EDGE_FALL)
         {
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
             uint32_t pioLock = psramPioLock();
 #endif
             pio_sm_set_enabled(pio0, 0, false);
             pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
             psramPioUnlock(pioLock);
 #endif
         }
@@ -113,11 +113,11 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
             u32 resetTime = time - sResetStart;
             if (resetTime > 700000)
             {
-            #ifdef ENABLE_PSRAM_ROM_CACHE
+            #ifdef ENABLE_PSRAM_CACHE
                 uint32_t pioLock2 = psramPioLock();
             #endif
                 pio_sm_set_enabled(pio0, 0, false);
-            #ifdef ENABLE_PSRAM_ROM_CACHE
+            #ifdef ENABLE_PSRAM_CACHE
                 psramPioUnlock(pioLock2);
             #endif
             }
@@ -131,7 +131,7 @@ void __scratch_x("cpu1") core1_entry(void)
 {
     irq_set_mask_enabled(~0u, false);
     scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS;
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     // Before game mode needs the scrambler, run the PSRAM probe + full-chip
     // test here on core1. Its bursts use the pio0 ctrl spinlock (not IRQ
     // shielding), so core0's cart protocol is unaffected. Once gComputeScrambler
@@ -240,7 +240,7 @@ int __time_critical_func(main)()
 
     dma_channel_claim(0);
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     // The pio0 ctrl spinlock must exist before any resetNtrCard()/gpioIrq()
     // call (both take it around SM0 ctrl writes) and before core1 starts
     // (core1's PSRAM bursts take it too). Initialize it once, up front -
@@ -367,8 +367,8 @@ int __time_critical_func(main)()
     // up, the problem is UART wiring/baud, not the firmware.
     LOG("\n[BOOT] DSpico firmware up, sysclk=%lu MHz, UART log OK\n",
         (unsigned long)(clock_get_hz(clk_sys) / 1000000));
-    LOG("[BOOT] PSRAM ROM cache: %s\n",
-    #ifdef ENABLE_PSRAM_ROM_CACHE
+    LOG("[BOOT] PSRAM SD cache: %s\n",
+    #ifdef ENABLE_PSRAM_CACHE
         "compiled in"
     #else
         "not compiled"
@@ -382,7 +382,7 @@ int __time_critical_func(main)()
 
     tryRebootToBootsel();
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     // romCacheInit() does only the PSRAM hardware init here (GPIO, reset, PIO
     // SM2/SM3 config, pio0 ctrl spinlock) - the probe and full-chip test run
     // on core1 (core1_entry). Run it BEFORE pwr_initPowerSaving(): although it
@@ -409,7 +409,7 @@ int __time_critical_func(main)()
     #ifdef ENABLE_R4_MODE
         ntrc_gameR4Update();
     #endif
-    #ifdef ENABLE_PSRAM_ROM_CACHE
+    #ifdef ENABLE_PSRAM_CACHE
         ntrc_sdCacheFetchDrain();
         romCacheUpdate();
     #endif

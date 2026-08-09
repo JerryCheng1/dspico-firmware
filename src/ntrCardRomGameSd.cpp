@@ -3,7 +3,7 @@
 #include "r4.h"
 #include "ntrCardRom.h"
 #include "ntrCardRomGameNoScramble.h"
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
 #include "romCache.h"
 #endif
 
@@ -18,7 +18,7 @@ static bool sNextWriteBlockQueued = false;
 static bool sNextWriteIsLast = false;
 static u32 sNextWriteSector = 0xFFFFFFFF;
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
 // The SD sector cache backfills sectors served from the SD card. E3 sets this
 // to the sector it requested on a miss so E5 (which serves the data) knows
 // which sector to store. 0xFFFFFFFF = no store pending (cache hit, or a write
@@ -40,7 +40,7 @@ static volatile bool sPendingFetch;
 // bit-bang takes no lock). Must NOT be called from IRQ context.
 extern "C" void ntrc_sdCacheFetchDrain(void)
 {
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     if (!sPendingFetch)
         return;
 
@@ -63,7 +63,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu
     ntrc_noPayload(pio);
     sCurSdSector = 0xFFFFFFFF;
     sReadSector = word;
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     // Cache hit: the sector is in PSRAM, but we must NOT read it here (a
     // psram_read in PIO0_IRQ_0 blackouts the IRQ and breaks the loader). Do a
     // tag-only check; on a hit record the sector for the main-loop drain
@@ -152,7 +152,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd0(ntr_rom_emu_t* romEmu
     // without scrambling to save time
     ntrc_dmaToBus(&sSdSectorBuf[sBufferIndex * 512], 512);
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
     // Backfill the sector we just served into the PSRAM cache (if this was a
     // cache miss served from the SD). Capture the sector index BEFORE the
     // sReadSector++/buffer flip below. romCacheSdStore() is ASYNC: it only

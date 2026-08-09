@@ -131,7 +131,7 @@ void ntrc_gameR4Update(void);
 void ntrc_resetR4(void);
 #endif
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
+#ifdef ENABLE_PSRAM_CACHE
 /// @brief Main-loop drain for an async SD cache hit: fills SD buffer 0 from
 ///        PSRAM and marks it ready for E4. Call from the core0 main loop;
 ///        must NOT be called from PIO0_IRQ_0.

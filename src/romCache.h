@@ -6,12 +6,6 @@
 extern "C" {
 #endif
 
-// The cache mirrors the granularity of the R4 ROM read path: one line holds
-// one 16 KB ROM block (the size of sR4RomBlockLarge).
-#define ROM_CACHE_LINE_SHIFT    14
-#define ROM_CACHE_LINE_SIZE     (1u << ROM_CACHE_LINE_SHIFT)
-#define ROM_CACHE_NUM_LINES     (PSRAM_SIZE_BYTES / ROM_CACHE_LINE_SIZE)
-
 /// @brief Initializes the PSRAM hardware only (no probe). The probe and
 ///        full-chip test run on core1 via romCacheCore1Poll().
 void romCacheInit(void);
@@ -20,32 +14,18 @@ void romCacheInit(void);
 ///        in scrambler-idle time. Returns true if it did PSRAM work.
 bool romCacheCore1Poll(void);
 
-/// @brief Returns true once the background full-chip test has passed.
-///        Until then (or when no PSRAM is fitted) all fetches miss and ROM
-///        data is served from the SD card directly.
+/// @brief Returns true once the PSRAM probe passed (and the full-chip test, if
+///        enabled). Until then (or when no PSRAM is fitted) all SD cache
+///        lookups miss and sectors are served from the SD card directly.
 bool romCacheIsAvailable(void);
-
-/// @brief Invalidates all cache lines. Must be called when the ROM changes.
-void romCacheInvalidate(void);
-
-/// @brief Tries to serve the 16 KB ROM block at \p blockAddr from the cache.
-/// @param blockAddr The ROM address of the block. Must be 16 KB aligned.
-/// @param dst Destination buffer of ROM_CACHE_LINE_SIZE bytes.
-/// @return true on a cache hit (\p dst filled), false on a miss.
-bool romCacheFetch(u32 blockAddr, u8* dst);
-
-/// @brief Stores the 16 KB ROM block at \p blockAddr in the cache.
-/// @param blockAddr The ROM address of the block. Must be 16 KB aligned.
-/// @param src Source buffer of ROM_CACHE_LINE_SIZE bytes.
-void romCacheStore(u32 blockAddr, const u8* src);
 
 
 // ---------------------------------------------------------------------------
 // SD sector cache (for the E3/E4/E5 block-device path used by pico-loader).
-// pico-loader reads SD sectors directly via the E3/E4/E5 commands and never
-// uses the B6 ROM path above. This direct-mapped 512 B/line cache sits in
-// PSRAM and is consulted on E3 (hit -> serve from PSRAM, skip the SD read)
-// and backfilled on E5 (a sector served from the SD is stored for re-reads).
+// pico-loader reads SD sectors directly via the E3/E4/E5 commands. This
+// direct-mapped 512 B/line cache fills the whole 8 MB PSRAM and is consulted
+// on E3 (hit -> serve from PSRAM, skip the SD read) and backfilled on E5 (a
+// sector served from the SD is stored for re-reads).
 //
 // All PSRAM access is ASYNC: the E5 IRQ handler only does a ~1 us memcpy and
 // sets a pending flag; the actual psram_write runs in romCacheSdStoreDrain()
@@ -62,9 +42,15 @@ void romCacheStore(u32 blockAddr, const u8* src);
 // array and increments counters (~1 us, no PSRAM access); the actual
 // psram_read runs in ntrc_sdCacheFetchDrain() on the main loop. The STORE
 // path is async via romCacheSdStore()/romCacheSdStoreDrain() as below.
-#define SD_CACHE_NUM_LINES   512
+//
+// The tag table (sSdTags) lives in SRAM, NOT PSRAM: the E3 IRQ handler must
+// resolve a hit/miss in nanoseconds (one LDR). A PSRAM tag read would cost a
+// full ~10-20 us bit-bang transaction (cmd+addr+dummy) inside PIO0_IRQ_0 -
+// exactly the blackout that breaks the cart protocol. 16384 lines * 4 B =
+// 64 KB of SRAM; the data (16384 * 512 B = 8 MB) fills the PSRAM.
 #define SD_CACHE_LINE_SIZE   512
 #define SD_CACHE_LINE_SHIFT  9
+#define SD_CACHE_NUM_LINES   (PSRAM_SIZE_BYTES / SD_CACHE_LINE_SIZE) // 16384
 
 /// @brief Zeros the SD sector cache tags. Called once at boot after romCacheInit.
 void romCacheSdInit(void);

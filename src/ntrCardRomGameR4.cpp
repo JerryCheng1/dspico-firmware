@@ -4,9 +4,6 @@
 #include "sd/fatfs/ff.h"
 #include "ntrCardRom.h"
 #include "ntrCardRomGameNoScramble.h"
-#ifdef ENABLE_PSRAM_ROM_CACHE
-#include "romCache.h"
-#endif
 
 #ifdef ENABLE_R4_MODE
 
@@ -32,12 +29,6 @@ static u8 sR4SaveBlock[512];
 
 static u32 sR4RomBlockLargeAddr = 0xFFFFFFFF;
 static u8 sR4RomBlockLarge[16384];//512];
-
-#ifdef ENABLE_PSRAM_ROM_CACHE
-// Block address of the last ROM fetch that missed the cache. Used to detect
-// sequential streams, which bypass the cache (see below).
-static u32 sLastRomFetchMissBlock = 0xFFFFFFFF;
-#endif
 
 static DWORD sClusterTab[16384];
 static DWORD sSaveClusterTab[4096];
@@ -242,11 +233,6 @@ extern "C" void __time_critical_func(ntrc_gameR4Update)(void)
 
         gNtrRomEmu.r4Mode = true;
         sInitR4Rom = false;
-    #ifdef ENABLE_PSRAM_ROM_CACHE
-        romCacheInvalidate();
-        romCacheSdInvalidate();
-        sLastRomFetchMissBlock = 0xFFFFFFFF;
-    #endif
     }
 
     if (sInitR4Save)
@@ -265,28 +251,9 @@ extern "C" void __time_critical_func(ntrc_gameR4Update)(void)
         u32 blockAddr = sR4RomFetchAddr & ~0x3FFF;
         if (blockAddr != sR4RomBlockLargeAddr)
         {
-        #ifdef ENABLE_PSRAM_ROM_CACHE
-            if (!romCacheFetch(blockAddr, sR4RomBlockLarge))
-            {
-                while (f_lseek(&sRomFile, blockAddr) != FR_OK);
-                UINT br;
-                while (f_read(&sRomFile, sR4RomBlockLarge, sizeof(sR4RomBlockLarge), &br) != FR_OK);
-                // Sequential streams (movies, maps, ...) are read once and never
-                // re-read, so they bypass the cache. This keeps one-off streams
-                // from evicting repeatedly re-read hot data such as font areas.
-                // Note: only blocks read from the SD update sLastRomFetchMissBlock,
-                // so a cache hit between two stream blocks does not hide the stream.
-                if (br == sizeof(sR4RomBlockLarge) && blockAddr != sLastRomFetchMissBlock + 0x4000)
-                {
-                    romCacheStore(blockAddr, sR4RomBlockLarge);
-                }
-                sLastRomFetchMissBlock = blockAddr;
-            }
-        #else
             while (f_lseek(&sRomFile, blockAddr) != FR_OK);
             UINT br;
             while (f_read(&sRomFile, sR4RomBlockLarge, sizeof(sR4RomBlockLarge), &br) != FR_OK);
-        #endif
             sR4RomBlockLargeAddr = blockAddr;
         }
 
@@ -334,11 +301,6 @@ extern "C" void ntrc_resetR4(void)
     sWriteSaveAddr = 0xFFFFFFFF;
 
     sR4RomBlockLargeAddr = 0xFFFFFFFF;
-#ifdef ENABLE_PSRAM_ROM_CACHE
-    romCacheInvalidate();
-    romCacheSdInvalidate();
-    sLastRomFetchMissBlock = 0xFFFFFFFF;
-#endif
 }
 
 #endif

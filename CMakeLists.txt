@@ -13,7 +13,7 @@ add_compile_definitions(DSpico
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
 
-option(ENABLE_PSRAM_ROM_CACHE "Cache ROM blocks in the external APS6404 PSRAM (GPIO22-26/29)" ON)
+option(ENABLE_PSRAM_CACHE "Cache SD sectors (E3/E5 path) in the external APS6404 PSRAM (GPIO22-26/29)" ON)
 option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
 
 add_executable(DSpico
@@ -71,9 +71,9 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/default.nds" AND EXISTS "${CMAKE_SOURCE_DIR}
   )
 endif()
 
-if(ENABLE_PSRAM_ROM_CACHE)
+if(ENABLE_PSRAM_CACHE)
   target_compile_definitions(DSpico PRIVATE
-    ENABLE_PSRAM_ROM_CACHE
+    ENABLE_PSRAM_CACHE
   )
 endif()
 
