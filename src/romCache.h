@@ -90,6 +90,16 @@ void romCacheSdStoreDrain(void);
 /// @brief Invalidates all SD sector cache lines.
 void romCacheSdInvalidate(void);
 
+/// @brief Invalidates the single cache line that maps to \p sector. Safe to
+///        call from PIO0_IRQ_0 (a single SRAM tag store, nanoseconds) - it
+///        MUST be called whenever a sector is written out-of-band (the F6
+///        write path writes the SD directly, write-around), so a subsequent
+///        E3 read of the same sector does not hit a stale cached copy. Not
+///        calling this after an F6 write risks returning pre-write data on
+///        the next E3 read of that sector (lost save / rollback).
+/// @param sector The SD LBA that was (or is being) written.
+void romCacheSdInvalidateSector(u32 sector);
+
 /// @brief Prints hit/miss statistics to the UART when they changed.
 ///        Rate limited; call repeatedly from the main loop.
 void romCacheUpdate(void);

@@ -149,6 +149,20 @@ void romCacheSdInvalidate(void)
         sSdTags[i] = 0xFFFFFFFF;
 }
 
+void romCacheSdInvalidateSector(u32 sector)
+{
+#if !SD_CACHE_ENABLE
+    return;
+#else
+    // Drop any cached copy of this sector so a later E3 read cannot serve
+    // pre-write data. A single SRAM store (~1 cycle) - safe from PIO0_IRQ_0.
+    // Called from the F6 write path (sdWritePayloadComplete), which writes the
+    // SD directly (write-around); without this the cache would keep serving the
+    // old sector until the line happens to be evicted.
+    sSdTags[sector & (SD_CACHE_NUM_LINES - 1)] = 0xFFFFFFFF;
+#endif
+}
+
 bool romCacheSdCheckHit(u32 sector)
 {
 #if !SD_CACHE_ENABLE

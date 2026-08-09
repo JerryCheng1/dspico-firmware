@@ -211,6 +211,13 @@ static void __scratch_y("cpu0") sdWritePayloadComplete(ntr_rom_emu_t* romEmu)
 {
     bool isFirst = (romEmu->cmd0 & WRITE_SD_DATA_IS_FIRST_FLAG) != 0;
     bool isLast = (romEmu->cmd0 & WRITE_SD_DATA_IS_LAST_FLAG) != 0;
+    // The SD is written directly (write-around), so invalidate any cached copy
+    // of the sector BEFORE the write lands - otherwise a later E3 read of this
+    // sector could hit the stale pre-write data (lost save). Single SRAM tag
+    // store, IRQ-safe. Done for every written sector (isFirst and chained).
+#ifdef ENABLE_PSRAM_CACHE
+    romCacheSdInvalidateSector(romEmu->cmd1);
+#endif
     if (isFirst)
     {
         if (!gSdCard.TryBeginWriteSectors(sSdSectorBuf, romEmu->cmd1, 1, !isLast))
