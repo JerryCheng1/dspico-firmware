@@ -244,6 +244,7 @@ extern "C" void __time_critical_func(ntrc_gameR4Update)(void)
         sInitR4Rom = false;
     #ifdef ENABLE_PSRAM_ROM_CACHE
         romCacheInvalidate();
+        romCacheSdInvalidate();
         sLastRomFetchMissBlock = 0xFFFFFFFF;
     #endif
     }
@@ -335,6 +336,7 @@ extern "C" void ntrc_resetR4(void)
     sR4RomBlockLargeAddr = 0xFFFFFFFF;
 #ifdef ENABLE_PSRAM_ROM_CACHE
     romCacheInvalidate();
+    romCacheSdInvalidate();
     sLastRomFetchMissBlock = 0xFFFFFFFF;
 #endif
 }

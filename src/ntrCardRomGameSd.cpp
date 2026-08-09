@@ -3,6 +3,9 @@
 #include "r4.h"
 #include "ntrCardRom.h"
 #include "ntrCardRomGameNoScramble.h"
+#ifdef ENABLE_PSRAM_ROM_CACHE
+#include "romCache.h"
+#endif
 
 static u8 sSdSectorBuf[1024];
 static u32 sCurSdSector = 0xFFFFFFFF;
@@ -15,11 +18,72 @@ static bool sNextWriteBlockQueued = false;
 static bool sNextWriteIsLast = false;
 static u32 sNextWriteSector = 0xFFFFFFFF;
 
+#ifdef ENABLE_PSRAM_ROM_CACHE
+// The SD sector cache backfills sectors served from the SD card. E3 sets this
+// to the sector it requested on a miss so E5 (which serves the data) knows
+// which sector to store. 0xFFFFFFFF = no store pending (cache hit, or a write
+// path). Kept separate from sReadSector because E5 serves sReadSector and then
+// bumps it before we store, and double-buffering can interleave.
+static volatile u32 sPendingStoreSector = 0xFFFFFFFF;
+
+// Async cache-HIT state. On a hit E3 (PIO0_IRQ_0) only does a tag check - it
+// must NOT psram_read there (that blackouts the IRQ). Instead it records the
+// sector here and leaves buffer 0 invalid; ntrc_sdCacheFetchDrain() on the
+// main loop does the bit-bang psram_read into buffer 0 and marks it valid, so
+// E4 reports not-ready until the drain completes, then ready.
+static volatile u32 sPendingFetchSector = 0xFFFFFFFF;
+static volatile bool sPendingFetch;
+#endif
+
+// Main-loop drain for an async SD cache hit. Fills buffer 0 from PSRAM and
+// marks it valid so E4 reports ready. Runs on core0 (preemptible by PIO0_IRQ_0,
+// bit-bang takes no lock). Must NOT be called from IRQ context.
+extern "C" void ntrc_sdCacheFetchDrain(void)
+{
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    if (!sPendingFetch)
+        return;
+
+    u32 sector = sPendingFetchSector;
+    // Fill buffer 0 from the PSRAM cache (bit-bang, ~64 us). If the tag was
+    // evicted in the interim (cannot happen with one sector in flight) leave
+    // the buffer invalid - E4 keeps reporting not-ready and the NDS would
+    // stall on this sector; the re-check makes that visible rather than serving
+    // garbage.
+    if (romCacheSdReadCached(sector, &sSdSectorBuf[0]))
+    {
+        sSdSectorBuffersSectors[0] = sector;
+    }
+    sPendingFetch = false;
+#endif
+}
+
 extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_noPayload(pio);
     sCurSdSector = 0xFFFFFFFF;
     sReadSector = word;
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    // Cache hit: the sector is in PSRAM, but we must NOT read it here (a
+    // psram_read in PIO0_IRQ_0 blackouts the IRQ and breaks the loader). Do a
+    // tag-only check; on a hit record the sector for the main-loop drain
+    // (ntrc_sdCacheFetchDrain) and leave both buffers invalid so E4 reports
+    // not-ready until the drain fills buffer 0. No SD read is started.
+    if (romCacheSdCheckHit(word))
+    {
+        sSdSectorBuffersSectors[0] = 0xFFFFFFFF;
+        sSdSectorBuffersSectors[1] = 0xFFFFFFFF;
+        sBufferIndex = 0;
+        sReadBusy = false;
+        sPendingStoreSector = 0xFFFFFFFF; // hit: already cached, no backfill
+        sPendingFetchSector = word;
+        sPendingFetch = true;
+        ntrc_finishGameNoScrambleCmd1(romEmu);
+        return;
+    }
+    sPendingFetch = false;
+    sPendingStoreSector = word;
+#endif
     if (sSdSectorBuffersSectors[sBufferIndex] != word)
     {
         sSdSectorBuffersSectors[0] = 0xFFFFFFFF;
@@ -87,6 +151,24 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd0(ntr_rom_emu_t* romEmu
 
     // without scrambling to save time
     ntrc_dmaToBus(&sSdSectorBuf[sBufferIndex * 512], 512);
+
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    // Backfill the sector we just served into the PSRAM cache (if this was a
+    // cache miss served from the SD). Capture the sector index BEFORE the
+    // sReadSector++/buffer flip below. romCacheSdStore() is ASYNC: it only
+    // memcpy's the 512 B into an internal buffer and sets a pending flag (~1
+    // us, no PSRAM access), so it does not stall PIO0_IRQ_0. The actual
+    // psram_write runs later in romCacheSdStoreDrain() on the main loop.
+    // (A synchronous psram_write here blocks the IRQ: SM0 stages the next
+    // command word but the handler has not returned -> "failed to mount SD".)
+    u32 servedSector = sSdSectorBuffersSectors[sBufferIndex];
+    if (servedSector != 0xFFFFFFFF && servedSector == sPendingStoreSector)
+    {
+        romCacheSdStore(servedSector, &sSdSectorBuf[sBufferIndex * 512]);
+        sPendingStoreSector = 0xFFFFFFFF;
+    }
+#endif
+
     sReadSector++;
 
     sBufferIndex = 1 - sBufferIndex;

@@ -21,8 +21,27 @@ extern "C" {
 // Capacity of the fitted PSRAM: APS6404L-3SQR-ZR = 64 Mbit = 8 MB.
 #define PSRAM_SIZE_BYTES    (8 * 1024 * 1024)
 
-/// @brief Initializes the PSRAM and verifies it with a write/read self-test.
-/// @return true when the PSRAM is present and functional.
+/// @brief Hardware init only (GPIO, reset, PIO config). No bursts/probe.
+///        Safe during NDS boot. Also initializes the pio0 ctrl spinlock.
+void psram_init_hw(void);
+
+/// @brief Claims the pio0 ctrl spinlock used to serialize pio0->ctrl
+///        read-modify-writes across cores. Must be called once before any
+///        psramPioLock()/psram_init_hw() use - main() does this up front,
+///        before resetNtrCard()/gpioIrq() (which take the lock) and before
+///        core1 starts.
+void psram_init_lock(void);
+
+/// @brief Claims the pio0 ctrl spinlock (shared with core0's SM0 restarts).
+///        Call before any pio_sm_set_enabled/restart on core0 IRQ paths.
+uint32_t psramPioLock(void);
+void psramPioUnlock(uint32_t save);
+
+/// @brief Probes PSRAM with bursts. Run on core1 (bursts use the pio0
+///        spinlock, not IRQ shielding, but still take core time).
+bool psram_probe(void);
+
+/// @brief hw init + probe. Only when probe's bursts are safe (not during boot).
 bool psram_init(void);
 
 /// @brief Reads \p len bytes from PSRAM \p addr into \p buf.

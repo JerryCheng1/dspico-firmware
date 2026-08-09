@@ -57,6 +57,12 @@ static void resetNtrCard(void)
     ntrc_resetR4();
 #endif
     dma_channel_abort(0);
+    // SM0 ctrl read-modify-writes must be serialized against core1's PSRAM
+    // SM2/SM3 ctrl writes (pio_sm_set_enabled/restart do RMW on pio->ctrl).
+    // Take the PSRAM pio0 spinlock; core1 will finish its burst and yield.
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    uint32_t pioLock = psramPioLock();
+#endif
     pio_sm_set_enabled(pio0, 0, false);
     pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
     pio_sm_clear_fifos(pio0, 0);
@@ -66,6 +72,9 @@ static void resetNtrCard(void)
     irq_set_enabled(PIO0_IRQ_0, true);
     pio_sm_exec(pio0, 0, pio_encode_jmp(sProgramOffset));
     pio_sm_set_enabled(pio0, 0, true);
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    psramPioUnlock(pioLock);
+#endif
 #ifdef DETECT_CONSOLE_TYPE  
     setRomToDsiRom();
     gNtrRomEmu.cardId = 0xC00000C2;
@@ -88,8 +97,14 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
     {
         if (events & GPIO_IRQ_EDGE_FALL)
         {
+#ifdef ENABLE_PSRAM_ROM_CACHE
+            uint32_t pioLock = psramPioLock();
+#endif
             pio_sm_set_enabled(pio0, 0, false);
             pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
+#ifdef ENABLE_PSRAM_ROM_CACHE
+            psramPioUnlock(pioLock);
+#endif
         }
         if (events & GPIO_IRQ_EDGE_RISE)
         {
@@ -97,10 +112,18 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
         #ifdef ENABLE_PREVENT_DSI_AUTOBOOT
             u32 resetTime = time - sResetStart;
             if (resetTime > 700000)
+            {
+            #ifdef ENABLE_PSRAM_ROM_CACHE
+                uint32_t pioLock2 = psramPioLock();
+            #endif
                 pio_sm_set_enabled(pio0, 0, false);
+            #ifdef ENABLE_PSRAM_ROM_CACHE
+                psramPioUnlock(pioLock2);
+            #endif
+            }
             sResetStart = time;
         #endif
-        }   
+        }
     }        
 }
 
@@ -108,6 +131,37 @@ void __scratch_x("cpu1") core1_entry(void)
 {
     irq_set_mask_enabled(~0u, false);
     scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS;
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    // Before game mode needs the scrambler, run the PSRAM probe + full-chip
+    // test here on core1. Its bursts use the pio0 ctrl spinlock (not IRQ
+    // shielding), so core0's cart protocol is unaffected. Once gComputeScrambler
+    // goes true, switch to filling the scrambler ring and only interleave test
+    // steps when the ring has enough headroom.
+    while (!gComputeScrambler)
+    {
+        gScramblerRingWPtr = gScramblerRing;
+        if (!romCacheCore1Poll())
+        {
+            // probe/test done (or terminal): park until game mode.
+            __wfe();
+        }
+    }
+    while (1)
+    {
+        u32* wPtr = gScramblerRingWPtr;
+        u32* next = SCR_RING_WRAP(wPtr + 1);
+        if (next == gNtrRomEmu.scrRingRPtr)
+        {
+            // ring full: spend the idle slot on the PSRAM test.
+            romCacheCore1Poll();
+            __wfe();
+            continue;
+        }
+
+        *wPtr = scr_getNext32(&gScramblerState);
+        gScramblerRingWPtr = next;
+    }
+#else
     while (!gComputeScrambler)
     {
         gScramblerRingWPtr = gScramblerRing;
@@ -126,6 +180,7 @@ void __scratch_x("cpu1") core1_entry(void)
         *wPtr = scr_getNext32(&gScramblerState);
         gScramblerRingWPtr = next;
     }
+#endif
 }
 
 static void initSd(void)
@@ -184,6 +239,17 @@ int __time_critical_func(main)()
     set_sys_clock_pll(1200000000, 6, 1);
 
     dma_channel_claim(0);
+
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    // The pio0 ctrl spinlock must exist before any resetNtrCard()/gpioIrq()
+    // call (both take it around SM0 ctrl writes) and before core1 starts
+    // (core1's PSRAM bursts take it too). Initialize it once, up front -
+    // psram_init_hw() is too late: resetNtrCard() runs first in boot and on
+    // every NDS reset, and psramPioLock() on an un-initialized (NULL) lock
+    // dereferences address 0 (the flash/VTOR base), corrupting state and
+    // crashing the cart protocol on game entry.
+    psram_init_lock();
+#endif
 
     memset(&gNtrRomEmu, 0, sizeof(gNtrRomEmu));
 
@@ -316,19 +382,24 @@ int __time_critical_func(main)()
 
     tryRebootToBootsel();
 
-    pwr_initPowerSaving();
-
-#ifdef ENABLE_UART_LOG
-    // pwr_initPowerSaving() stops clk_peri, which freezes the debug UART.
-    // Restart it so logs after boot (PSRAM test, cache stats) stay visible.
-    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-        clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+#ifdef ENABLE_PSRAM_ROM_CACHE
+    // romCacheInit() does only the PSRAM hardware init here (GPIO, reset, PIO
+    // SM2/SM3 config, pio0 ctrl spinlock) - the probe and full-chip test run
+    // on core1 (core1_entry). Run it BEFORE pwr_initPowerSaving(): although it
+    // now uses busy_wait_us (not WFI), keeping it before pwr is harmless and
+    // matches the boot ordering.
+    romCacheInit();
+    romCacheSdInit();
 #endif
 
-#ifdef ENABLE_PSRAM_ROM_CACHE
-    // After pwr_initPowerSaving(): the background test's wake timer drops the
-    // core out of deep sleep, and power saving would re-enable it.
-    romCacheInit();
+#ifdef ENABLE_UART_LOG
+    // Log build: skip pwr_initPowerSaving() so clk_peri (UART baud clock) and
+    // the timer stay on - the deep-sleep config freezes both, hiding all logs
+    // after this point and breaking the deferred probe's bus-idle timing. The
+    // daily nolog build below calls it for power saving.
+    LOG("[BOOT] pwr_initPowerSaving() skipped (log build)\n");
+#else
+    pwr_initPowerSaving();
 #endif
 
     while (1)
@@ -339,6 +410,7 @@ int __time_critical_func(main)()
         ntrc_gameR4Update();
     #endif
     #ifdef ENABLE_PSRAM_ROM_CACHE
+        ntrc_sdCacheFetchDrain();
         romCacheUpdate();
     #endif
         __wfi();

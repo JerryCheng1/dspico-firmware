@@ -31,6 +31,44 @@
 
 #define PSRAM_PIO       pio0
 
+// Spinlock guarding pio0->ctrl read-modify-writes. Both cores touch pio0's
+// state-machine control register: core0's resetNtrCard()/gpioIrq() restart
+// SM0, core1 (PSRAM probe/test) and core0 (cache hit reads) restart SM2/SM3.
+// pio_sm_set_enabled/restart do a read-modify-write of pio->ctrl, so without
+// a lock one core can clobber the other's bit. Replaces the old
+// save_and_disable_interrupts() shielding: that blocked the NDS cart IRQ for
+// ~20 us per burst and caused white screens / "failed to mount SD". The
+// spinlock keeps cart IRQs enabled; only the pio0 ctrl word is serialized.
+static spin_lock_t* sPioLock;
+
+void psram_init_lock(void)
+{
+    if (!sPioLock)
+        sPioLock = spin_lock_instance(spin_lock_claim_unused(true));
+}
+
+static inline uint32_t psramPioLockImpl(void)
+{
+    return spin_lock_blocking(sPioLock);
+}
+
+static inline void psramPioUnlockImpl(uint32_t save)
+{
+    spin_unlock(sPioLock, save);
+}
+
+// Exported wrappers for core0 IRQ paths (resetNtrCard/gpioIrq) that cannot
+// see the static inline versions.
+uint32_t psramPioLock(void)
+{
+    return psramPioLockImpl();
+}
+
+void psramPioUnlock(uint32_t save)
+{
+    psramPioUnlockImpl(save);
+}
+
 // pio0 SM0 is the cartridge emulator (ntr_card), SM1 the WRFUXXED SPI-UART;
 // the PSRAM pump takes SM2/SM3.
 #define PSRAM_TX_SM     2
@@ -190,21 +228,19 @@ static inline void psramTxSmWait(void)
 
 static void __no_inline_not_in_flash_func(psramPioWriteBurst)(u32 addr, const u8* buf, u32 len)
 {
-    // The cartridge bus IRQ handlers (resetNtrCard on the reset pin,
-    // ntrc_pioIrq on sm0) do their own read-modify-writes of pio0 registers.
-    // Racing them here can lose an enable/restart on either side, which kills
-    // the burst mid-stream. A burst takes only a few microseconds, so keep it
-    // atomic.
-    uint32_t irqState = save_and_disable_interrupts();
+    // The whole transaction runs under the pio0 ctrl spinlock (NOT
+    // save_and_disable_interrupts): the PSRAM protocol needs CE# low ->
+    // command -> address -> data continuous, and pio0 ctrl read-modify-writes
+    // must be serialized across cores. The spinlock keeps the NDS cart IRQ
+    // enabled, so unlike the old IRQ-shielding this does not stall the cart
+    // protocol. The lock is held only for the few-us pio0 portion.
     psramMuxToSio();
     psramClkLow();
     psramCeLow();
     psramSendByteSerial(PSRAM_CMD_QUAD_WRITE);
 
+    uint32_t save = psramPioLock();
     psramMuxToPio();
-    // The 24-bit address takes the top 6 nibbles of the first stream word;
-    // the first data byte fills its bottom 2 nibbles so the nibble stream is
-    // gapless. Later words carry 4 data bytes each, big-endian.
     psramTxSmStart(6 + 2 * len, (addr << 8) | buf[0]);
     for (u32 off = 1; off < len; off += 4)
     {
@@ -214,21 +250,21 @@ static void __no_inline_not_in_flash_func(psramPioWriteBurst)(u32 addr, const u8
         pio_sm_put_blocking(PSRAM_PIO, sTxSm, w);
     }
     psramTxSmWait();
-
     psramMuxToSio();
+    psramPioUnlock(save);
+
     psramCeHigh();
-    restore_interrupts(irqState);
 }
 
 static void __no_inline_not_in_flash_func(psramPioReadBurst)(u32 addr, u8* buf, u32 len)
 {
-    // See psramPioWriteBurst for why this runs with interrupts disabled.
-    uint32_t irqState = save_and_disable_interrupts();
+    // See psramPioWriteBurst: full transaction under the pio0 ctrl spinlock.
     psramMuxToSio();
     psramClkLow();
     psramCeLow();
     psramSendByteSerial(PSRAM_CMD_FAST_READ_QUAD);
 
+    uint32_t save = psramPioLock();
     // address + dummy clocks via the TX pump. The address word's 2 spare
     // bottom nibbles are zeros and serve as the first 2 dummy clocks; a zero
     // word provides the remaining 4.
@@ -251,8 +287,9 @@ static void __no_inline_not_in_flash_func(psramPioReadBurst)(u32 addr, u8* buf, 
     pio_sm_set_enabled(PSRAM_PIO, sRxSm, false);
 
     psramMuxToSio();
+    psramPioUnlock(save);
+
     psramCeHigh();
-    restore_interrupts(irqState);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +299,14 @@ static void __no_inline_not_in_flash_func(psramPioReadBurst)(u32 addr, u8* buf, 
 static inline void psramBbSendNibble(u8 nibble)
 {
     psramClkLow();
-    // NOTE: do NOT use hw_write_masked() on SIO registers - it writes through
-    // the 0x1000 XOR alias, which the SIO block does not implement (its bus has
-    // no alias decoding), so the write is silently dropped and the pins never
-    // change. Plain read-modify-write of GPIO_OUT is safe here.
-    sio_hw->gpio_out = (sio_hw->gpio_out & ~PSRAM_IO_MASK) | ((u32)nibble << PSRAM_PIN_IO0);
+    // Drive the 4 data bits atomically via SET/CLR (two single-write SIO
+    // ops) instead of a read-modify-write of GPIO_OUT. An RMW would clobber
+    // any bit the other core sets concurrently between the read and the
+    // write-back (the historical USB PIN_IRQ toggle raced here; USB is gone
+    // but the atomic form is correct regardless). SCLK is low during both
+    // writes, so the momentary all-low between CLR and SET is not sampled.
+    sio_hw->gpio_clr = PSRAM_IO_MASK;
+    sio_hw->gpio_set = (u32)nibble << PSRAM_PIN_IO0;
     psramClkHigh();
 }
 
@@ -446,7 +486,10 @@ static bool psramProbe(void)
     return true;
 }
 
-bool psram_init(void)
+// Hardware init only: GPIO, reset, PIO SM2/SM3 config. No bursts, no probe.
+// Safe during boot. Uses busy_wait_us (not sleep_us): this may run on core1
+// which has interrupts disabled, where sleep_us's WFI would hang.
+void psram_init_hw(void)
 {
     gpio_init_mask(PSRAM_PIN_MASK);
 
@@ -463,14 +506,47 @@ bool psram_init(void)
     }
 
     // The device needs 150 us after power-up before it accepts commands.
-    sleep_us(200);
+    busy_wait_us(200);
 
     // Software reset (RSTEN must be immediately followed by RST).
     psramSendCmd(PSRAM_CMD_RESET_ENABLE);
     psramSendCmd(PSRAM_CMD_RESET);
-    sleep_us(50);
+    busy_wait_us(50);
 
+    // The PIO pump (pio0 SM2/SM3) shares pio0's single round-robin execution
+    // slot with the cartridge SM0. An earlier bit-bang-only mode
+    // (PSRAM_FORCE_BITBANG=1) was adopted because PIO bursts seemed to corrupt
+    // the cart protocol - but that was diagnosed while a separate bug (the USB
+    // PIN_IRQ gpio_out race) was active. With USB removed, the PIO pump is safe
+    // for the core1 probe (which runs before/during the loader menu) and for
+    // cache-OFF gameplay.
+    //
+    // HOWEVER: once the SD sector cache STORE path runs on the core0 main loop
+    // (romCacheSdStoreDrain, async out of the E5 IRQ), a PIO psram_write there
+    // bursts SM2/SM3 concurrently with the heavy E3/E4/E5 cart traffic of the
+    // loader's SD mount - and that breaks mount ("failed to mount SD card")
+    // even though the drain is fully preemptible and takes no contended lock.
+    // The bit-bang path (pure SIO, no pio0 SM) is being tested as the drain
+    // data path to isolate whether pio0 slot contention is the cause. Set 1 to
+    // force bit-bang for ALL PSRAM access (probe + cache).
+#ifndef PSRAM_FORCE_BITBANG
+#define PSRAM_FORCE_BITBANG 1
+#endif
+#if PSRAM_FORCE_BITBANG
+    // Skip psramPioInit entirely: do NOT load the PIO programs, do NOT claim
+    // SM2/SM3, leave pio0 untouched. All access goes through psramBbReadBurst/
+    // psramBbWriteBurst (SIO only).
+    sUsePio = false;
+#else
     sUsePio = psramPioInit();
+#endif
+    LOG("PSRAM: hw init done (%s ready)\n", sUsePio ? "PIO" : "bit-bang");
+}
+
+// Probe with bursts. Must NOT run during NDS boot (bursts block/stall the
+// boot command stream). Call after boot from the main loop.
+bool psram_probe(void)
+{
     LOG("PSRAM: probing (%s path)...\n", sUsePio ? "PIO" : "bit-bang");
     if (psramProbe())
     {
@@ -494,4 +570,10 @@ bool psram_init(void)
         }
     }
     return false;
+}
+
+bool psram_init(void)
+{
+    psram_init_hw();
+    return psram_probe();
 }
