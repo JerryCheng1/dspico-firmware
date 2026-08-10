@@ -173,6 +173,15 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSaveWriteCmd1(ntr_rom_emu_t*
     ntrc_finishGameNoScrambleCmd1WithReadPayload(romEmu, (u32*)sR4SaveBlock, 512, r4SaveWritePayloadComplete);
 }
 
+#endif // ENABLE_R4_MODE
+
+#ifndef ENABLE_R4_MODE
+// B7 still exists in the no-scramble command table when R4 emulation is
+// disabled. Keep a small deterministic page for its non-R4 dummy response;
+// the R4 build uses sR4RomBlockLarge instead.
+static u8 sNoScrambleDummyPage[512];
+#endif
+
 extern "C" void __scratch_y("cpu0") ntrc_gameNoScrambleReadPageCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 512);
@@ -190,13 +199,17 @@ extern "C" void __scratch_y("cpu0") ntrc_gameNoScrambleReadPageCmd1(ntr_rom_emu_
 {
 #ifdef ENABLE_R4_MODE
     if (!romEmu->r4Mode)
-#endif
     {
         //just send some garbage
         ntrc_dmaToBus(sR4RomBlockLarge, 512);
     }
+#else
+    ntrc_dmaToBus(sNoScrambleDummyPage, 512);
+#endif
     ntrc_finishGameNoScrambleCmd1(romEmu);
 }
+
+#ifdef ENABLE_R4_MODE
 
 static void initFileFromFatEntry(FIL* file, u32 fatEntryAddr, bool save)
 {

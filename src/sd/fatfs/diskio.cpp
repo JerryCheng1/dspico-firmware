@@ -12,6 +12,9 @@
 #include "pico/stdlib.h"
 #include "ff.h"			/* Obtains integer types */
 #include "diskio.h"		/* Declarations of disk functions */
+#ifdef ENABLE_PSRAM_CACHE
+#include "../../romCache.h"
+#endif
 
 /* Definitions of physical drive number for each drive */
 #define DEV_SD		0
@@ -101,6 +104,13 @@ extern "C" DRESULT disk_write (
     {
         case DEV_SD:
         {
+#ifdef ENABLE_PSRAM_CACHE
+            // FatFs writes (notably R4 save-file updates) bypass the F6/raw
+            // cartridge write callbacks. Invalidate every physical sector at
+            // this final write-through boundary so E3 cannot serve stale data.
+            for (UINT i = 0; i < count; i++)
+                romCacheSdInvalidateSector((u32)sector + i);
+#endif
             while (!gSdCard.TryWriteSectorsSync(buff, sector, count));
             return RES_OK;
         }

@@ -1,4 +1,5 @@
 #include "common.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include "xor.h"
 #include "romData.h"
@@ -16,7 +17,7 @@ void ntrc_gameCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
     irq_set_enabled(PIO0_IRQ_0, false);
 
     puts("Unknown game command");
-    printf("%08X%08X\n", romEmu->cmd0, romEmu->cmd1);
+    printf("%08" PRIX32 "%08" PRIX32 "\n", romEmu->cmd0, romEmu->cmd1);
 }
 
 void __time_critical_func(ntrc_gameCmd0Dummy)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)

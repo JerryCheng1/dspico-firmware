@@ -1,9 +1,7 @@
 #include "common.h"
-#include <stdio.h>
+#include <inttypes.h>
 #include <string.h>
-#include "hardware/structs/scb.h"
 #include "hardware/sync.h"
-#include "ntrCardRom.h"
 #include "romCache.h"
 
 #ifdef ENABLE_PSRAM_CACHE
@@ -132,13 +130,37 @@ bool romCacheIsAvailable(void)
 #ifndef SD_CACHE_STORE
 #define SD_CACHE_STORE 1
 #endif
-static u32 sSdTags[SD_CACHE_NUM_LINES];
+// Tags and generations are touched by both the core0 main loop and
+// PIO0_IRQ_0, so they must be volatile. Each write-around SD update bumps the
+// mapped line's generation. A PSRAM read/backfill may publish its result only
+// if the generation is unchanged across the slow PSRAM operation; otherwise
+// it would resurrect data invalidated while that operation was in flight.
+// One byte per line keeps the metadata affordable on RP2040; wrapping would
+// require 256 writes to the same mapped line before one ~64 us operation can
+// finish, which the serialized cartridge protocol cannot produce.
+static volatile u32 sSdTags[SD_CACHE_NUM_LINES];
+static volatile u8 sSdLineGenerations[SD_CACHE_NUM_LINES];
 volatile u32 sSdHits;
 volatile u32 sSdMisses;
 
+// Async store state. E5's IRQ handler copies the served sector into
+// sAsyncStoreBuf and sets sAsyncStorePending; the main loop drains it with the
+// real psram_write. Single-slot: if the main loop has not drained the previous
+// store when E5 offers another, the new one is dropped (the line simply stays
+// unfilled and is re-served from SD next time - correctness is unaffected).
+static u8 sAsyncStoreBuf[SD_CACHE_LINE_SIZE] __attribute__((aligned(4)));
+static volatile u32 sAsyncStoreSector;
+static volatile u8 sAsyncStoreGeneration;
+static volatile bool sAsyncStorePending;
+
 void romCacheSdInit(void)
 {
-    romCacheSdInvalidate();
+    sAsyncStorePending = false;
+    for (u32 i = 0; i < SD_CACHE_NUM_LINES; i++)
+    {
+        sSdTags[i] = 0xFFFFFFFF;
+        sSdLineGenerations[i] = 0;
+    }
     sSdHits = 0;
     sSdMisses = 0;
 }
@@ -146,20 +168,25 @@ void romCacheSdInit(void)
 void romCacheSdInvalidate(void)
 {
     for (u32 i = 0; i < SD_CACHE_NUM_LINES; i++)
+    {
         sSdTags[i] = 0xFFFFFFFF;
+        sSdLineGenerations[i]++;
+    }
 }
 
 void romCacheSdInvalidateSector(u32 sector)
 {
-#if !SD_CACHE_ENABLE
+#if !SD_CACHE_ENABLE && !SD_CACHE_STORE
     return;
 #else
-    // Drop any cached copy of this sector so a later E3 read cannot serve
-    // pre-write data. A single SRAM store (~1 cycle) - safe from PIO0_IRQ_0.
-    // Called from the F6 write path (sdWritePayloadComplete), which writes the
-    // SD directly (write-around); without this the cache would keep serving the
-    // old sector until the line happens to be evicted.
-    sSdTags[sector & (SD_CACHE_NUM_LINES - 1)] = 0xFFFFFFFF;
+    // Drop any cached copy and cancel publication by a PSRAM read/backfill
+    // already in flight for this direct-mapped line. Both are short SRAM
+    // stores, so this remains safe in PIO0_IRQ_0. Without the generation bump,
+    // a slow store drain preempted by an SD write could set the old tag again
+    // after this function returned, resurrecting pre-write data.
+    u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
+    sSdTags[lineIdx] = 0xFFFFFFFF;
+    sSdLineGenerations[lineIdx]++;
 #endif
 }
 
@@ -198,6 +225,7 @@ bool romCacheSdReadCached(u32 sector, u8* dst)
     return false;
 #else
     u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
+    u8 generation = sSdLineGenerations[lineIdx];
     // Re-check the tag: the only tag mutator is the store drain, which also
     // runs on the core0 main loop and is serialized with this drain (single
     // thread). With one sector in flight between E3 and E5, no eviction can
@@ -210,18 +238,17 @@ bool romCacheSdReadCached(u32 sector, u8* dst)
     // report not-ready (the buffer is still marked invalid until the caller
     // fills sSdSectorBuffersSectors after this returns).
     psram_read(lineIdx * SD_CACHE_LINE_SIZE, dst, SD_CACHE_LINE_SIZE);
-    return true;
+
+    // An SD write may have preempted the bit-bang read and invalidated this
+    // line. Validate and return while IRQs are briefly masked so the check is
+    // a coherent snapshot. The mask covers only SRAM loads, not PSRAM I/O.
+    uint32_t irqState = save_and_disable_interrupts();
+    bool stillValid = sSdLineGenerations[lineIdx] == generation &&
+                      sSdTags[lineIdx] == sector;
+    restore_interrupts(irqState);
+    return stillValid;
 #endif
 }
-
-// Async store state. E5's IRQ handler copies the served sector into
-// sAsyncStoreBuf and sets sAsyncStorePending; the main loop drains it with the
-// real psram_write. Single-slot: if the main loop has not drained the previous
-// store when E5 offers another, the new one is dropped (the line simply stays
-// unfilled and is re-served from SD next time - correctness is unaffected).
-static u8 sAsyncStoreBuf[SD_CACHE_LINE_SIZE] __attribute__((aligned(4)));
-static volatile u32 sAsyncStoreSector;
-static volatile bool sAsyncStorePending;
 
 void romCacheSdStore(u32 sector, const u8* src)
 {
@@ -236,8 +263,11 @@ void romCacheSdStore(u32 sector, const u8* src)
     if (sAsyncStorePending)
         return;
 
+    u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
+    u8 generation = sSdLineGenerations[lineIdx];
     memcpy(sAsyncStoreBuf, src, SD_CACHE_LINE_SIZE);
     sAsyncStoreSector = sector;
+    sAsyncStoreGeneration = generation;
     sAsyncStorePending = true;
 #endif
 }
@@ -251,13 +281,23 @@ void romCacheSdStoreDrain(void)
         return;
 
     u32 sector = sAsyncStoreSector;
+    u8 generation = sAsyncStoreGeneration;
     u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
     // Runs on the core0 main loop, NOT in PIO0_IRQ_0. The next E3/E4/E5 may
     // preempt this at a burst boundary, but those handlers do not touch PSRAM,
     // so they never contend for sAsyncStoreBuf or the pio0 ctrl spinlock.
     psram_write(lineIdx * SD_CACHE_LINE_SIZE, sAsyncStoreBuf, SD_CACHE_LINE_SIZE);
-    sSdTags[lineIdx] = sector;
-    sAsyncStorePending = false; // release the slot only after the write lands
+
+    // Publish the tag only if no write-around path invalidated this line while
+    // psram_write was running. Mask IRQs for the generation check + tag store
+    // so invalidation cannot land between them and be overwritten. This is a
+    // handful of SRAM instructions; the slow PSRAM transfer remains fully
+    // preemptible.
+    uint32_t irqState = save_and_disable_interrupts();
+    if (sSdLineGenerations[lineIdx] == generation)
+        sSdTags[lineIdx] = sector;
+    sAsyncStorePending = false; // release only after write/publication finishes
+    restore_interrupts(irqState);
 #endif
 }
 
@@ -417,7 +457,9 @@ void romCacheUpdate(void)
         u32 capKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024; // 8 MB
         u32 usedKb = (usedLines * SD_CACHE_LINE_SIZE) / 1024;
         u32 freeKb = capKb - usedKb;
-        LOG("[cache] SD hit=%u miss=%u rate=%u.%u%% | used=%u/%u lines (%uKB) free=%uKB/%uKB\n",
+        LOG("[cache] SD hit=%" PRIu32 " miss=%" PRIu32
+            " rate=%" PRIu32 ".%" PRIu32 "%% | used=%" PRIu32 "/%" PRIu32
+            " lines (%" PRIu32 "KB) free=%" PRIu32 "KB/%" PRIu32 "KB\n",
             (u32)sSdHits, (u32)sSdMisses, sdRate / 10, sdRate % 10,
             usedLines, (u32)SD_CACHE_NUM_LINES, usedKb, freeKb, capKb);
     }
@@ -446,9 +488,11 @@ void romCacheUpdate(void)
             // One-time summary of what the cache uses and how to read the
             // heartbeat. The SD cache is the only layer; it fills the PSRAM.
             u32 sdCapKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024;
-            LOG("PSRAM: probe OK (%lu ms), %u KB chip\n",
-                (u32)(millis() - sTestStart), PSRAM_SIZE_BYTES / 1024);
-            LOG("PSRAM: SD cache enabled - %u lines x %uB = %uKB (E3/E5 sector cache, fills chip)\n",
+            LOG("PSRAM: probe OK (%lu ms), %" PRIu32 " KB chip\n",
+                (unsigned long)(millis() - sTestStart),
+                (u32)(PSRAM_SIZE_BYTES / 1024));
+            LOG("PSRAM: SD cache enabled - %" PRIu32 " lines x %" PRIu32
+                "B = %" PRIu32 "KB (E3/E5 sector cache, fills chip)\n",
                 (u32)SD_CACHE_NUM_LINES, (u32)SD_CACHE_LINE_SIZE, sdCapKb);
             LOG("[cache] legend: SD hit/miss=E3/E5 sector cache; used=valid lines; rate=hit/(hit+miss)\n");
         }
@@ -459,8 +503,8 @@ void romCacheUpdate(void)
         if (!sLoggedFail)
         {
             sLoggedFail = true;
-            LOG("PSRAM: full-chip test FAILED @0x%08lX, cache stays disabled\n",
-                (u32)sTestFailAddr);
+            LOG("PSRAM: full-chip test FAILED @0x%08" PRIX32
+                ", cache stays disabled\n", (u32)sTestFailAddr);
         }
     }
 }

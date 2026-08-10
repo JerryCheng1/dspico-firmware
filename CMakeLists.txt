@@ -8,11 +8,11 @@ pico_sdk_init()
 add_compile_definitions(DSpico
   PICO_STACK_SIZE=0x600
   PICO_CORE1_STACK_SIZE=0x400
-  ENABLE_R4_MODE
   #DSPICO_ENABLE_WRFUXXED # This macro enables the WRFUXXED exploit to work.
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
 
+option(ENABLE_R4_MODE "Enable R4 emulation" ON)
 option(ENABLE_PSRAM_CACHE "Cache SD sectors (E3/E5 path) in the external APS6404 PSRAM (GPIO22-26/29)" ON)
 option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
 
@@ -74,6 +74,12 @@ endif()
 if(ENABLE_PSRAM_CACHE)
   target_compile_definitions(DSpico PRIVATE
     ENABLE_PSRAM_CACHE
+  )
+endif()
+
+if(ENABLE_R4_MODE)
+  target_compile_definitions(DSpico PRIVATE
+    ENABLE_R4_MODE
   )
 endif()
 

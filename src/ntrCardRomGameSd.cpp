@@ -45,16 +45,21 @@ extern "C" void ntrc_sdCacheFetchDrain(void)
         return;
 
     u32 sector = sPendingFetchSector;
-    // Fill buffer 0 from the PSRAM cache (bit-bang, ~64 us). If the tag was
-    // evicted in the interim (cannot happen with one sector in flight) leave
-    // the buffer invalid - E4 keeps reporting not-ready and the NDS would
-    // stall on this sector; the re-check makes that visible rather than serving
-    // garbage.
+    // Fill buffer 0 from the PSRAM cache (bit-bang, ~64 us). A write may have
+    // invalidated the line while it was in flight. In that case fall back to
+    // the SD card; if a write currently owns the SD interface, retain the
+    // pending request and retry from the main loop once it becomes idle.
     if (romCacheSdReadCached(sector, &sSdSectorBuf[0]))
     {
         sSdSectorBuffersSectors[0] = sector;
+        sPendingFetch = false;
     }
-    sPendingFetch = false;
+    else if (gSdCard.TryBeginReadSectors(&sSdSectorBuf[0], sector, 1))
+    {
+        sReadBusy = true;
+        sPendingStoreSector = sector;
+        sPendingFetch = false;
+    }
 #endif
 }
 
@@ -308,7 +313,13 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdWriteCmd0(ntr_rom_emu_t* r
 
 static void __scratch_y("cpu0") r4SdWritePayloadComplete(ntr_rom_emu_t* romEmu)
 {
-    if (__builtin_expect(!gSdCard.TryBeginWriteSectors(sSdSectorBuf, (romEmu->cmd0 << 8) >> 9, 1, false), false))
+    u32 sector = (romEmu->cmd0 << 8) >> 9;
+#ifdef ENABLE_PSRAM_CACHE
+    // R4 and pico-loader share the SD card. Invalidate the E3/E5 cache just
+    // like the F6 write path, including any async backfill already in flight.
+    romCacheSdInvalidateSector(sector);
+#endif
+    if (__builtin_expect(!gSdCard.TryBeginWriteSectors(sSdSectorBuf, sector, 1, false), false))
     {
         __breakpoint();
     }

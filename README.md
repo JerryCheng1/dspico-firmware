@@ -131,7 +131,17 @@ To compile and properly use the firmware, you will need to place a valid DS rom 
 Simply run `./compile.sh` to compile the firmware. Once it is complete, you will be able to find `DSpico.uf2` in the `build/` folder, which you can use to flash your DSpico board with.
 
 > [!IMPORTANT]
-> The firmware only works correctly when build with optimization. Recommended is `RelWithDebInfo`.
+> The firmware only works correctly when built with optimization. Recommended is `RelWithDebInfo`.
+
+### Host regression tests
+
+The cache-consistency tests use host stubs and do not require a ROM, the Pico SDK, or an ARM toolchain:
+
+```bash
+cmake -S tests -B build-host-tests
+cmake --build build-host-tests
+ctest --test-dir build-host-tests --output-on-failure
+```
 
 ## License
 
