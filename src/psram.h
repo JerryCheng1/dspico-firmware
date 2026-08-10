@@ -1,6 +1,12 @@
 #pragma once
 #include "common.h"
 
+// The production configuration uses only SIO bit-banging for external PSRAM.
+// CMake defines this explicitly; keep the safe default for standalone builds.
+#ifndef PSRAM_FORCE_BITBANG
+#define PSRAM_FORCE_BITBANG 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -21,24 +27,19 @@ extern "C" {
 // Capacity of the fitted PSRAM: APS6404L-3SQR-ZR = 64 Mbit = 8 MB.
 #define PSRAM_SIZE_BYTES    (8 * 1024 * 1024)
 
-/// @brief Hardware init only (GPIO, reset, PIO config). No bursts/probe.
-///        Safe during NDS boot. Also initializes the pio0 ctrl spinlock.
+/// @brief Hardware init only (GPIO and reset). No bursts/probe.
+///        Safe during NDS boot. PIO setup exists only in experimental builds.
 void psram_init_hw(void);
 
-/// @brief Claims the pio0 ctrl spinlock used to serialize pio0->ctrl
-///        read-modify-writes across cores. Must be called once before any
-///        psramPioLock()/psram_init_hw() use - main() does this up front,
-///        before resetNtrCard()/gpioIrq() (which take the lock) and before
-///        core1 starts.
+/// @brief Initializes the pio0 serialization lock in experimental PIO builds.
+///        The production bit-bang build does not call these helpers.
 void psram_init_lock(void);
 
-/// @brief Claims the pio0 ctrl spinlock (shared with core0's SM0 restarts).
-///        Call before any pio_sm_set_enabled/restart on core0 IRQ paths.
+/// @brief Experimental PIO-build serialization helpers.
 uint32_t psramPioLock(void);
 void psramPioUnlock(uint32_t save);
 
-/// @brief Probes PSRAM with bursts. Run on core1 (bursts use the pio0
-///        spinlock, not IRQ shielding, but still take core time).
+/// @brief Probes PSRAM with bit-bang bursts. Run on core1.
 bool psram_probe(void);
 
 /// @brief hw init + probe. Only when probe's bursts are safe (not during boot).

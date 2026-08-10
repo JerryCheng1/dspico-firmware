@@ -15,6 +15,7 @@ add_compile_definitions(DSpico
 option(ENABLE_R4_MODE "Enable R4 emulation" ON)
 option(ENABLE_PSRAM_CACHE "Cache SD sectors (E3/E5 path) in the external APS6404 PSRAM (GPIO22-26/29)" ON)
 option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
+option(PSRAM_USE_PIO "Use the experimental PIO0 PSRAM data path instead of SIO bit-bang" OFF)
 
 add_executable(DSpico
   src/main.cpp
@@ -77,6 +78,12 @@ if(ENABLE_PSRAM_CACHE)
   )
 endif()
 
+if(PSRAM_USE_PIO)
+  target_compile_definitions(DSpico PRIVATE PSRAM_FORCE_BITBANG=0)
+else()
+  target_compile_definitions(DSpico PRIVATE PSRAM_FORCE_BITBANG=1)
+endif()
+
 if(ENABLE_R4_MODE)
   target_compile_definitions(DSpico PRIVATE
     ENABLE_R4_MODE
@@ -94,7 +101,9 @@ endif()
 
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2040_sdio.pio)
-pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
+if(PSRAM_USE_PIO)
+  pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
+endif()
 
 pico_add_extra_outputs(DSpico)
 target_link_libraries(DSpico pico_stdlib hardware_pio hardware_dma pico_multicore)

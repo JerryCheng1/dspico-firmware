@@ -57,10 +57,9 @@ static void resetNtrCard(void)
     ntrc_resetR4();
 #endif
     dma_channel_abort(0);
-    // SM0 ctrl read-modify-writes must be serialized against core1's PSRAM
-    // SM2/SM3 ctrl writes (pio_sm_set_enabled/restart do RMW on pio->ctrl).
-    // Take the PSRAM pio0 spinlock; core1 will finish its burst and yield.
-#ifdef ENABLE_PSRAM_CACHE
+    // Experimental PSRAM-PIO builds share pio0 with SM0 and need the lock.
+    // Production bit-bang builds never touch pio0 from the PSRAM path.
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
     uint32_t pioLock = psramPioLock();
 #endif
     pio_sm_set_enabled(pio0, 0, false);
@@ -72,7 +71,7 @@ static void resetNtrCard(void)
     irq_set_enabled(PIO0_IRQ_0, true);
     pio_sm_exec(pio0, 0, pio_encode_jmp(sProgramOffset));
     pio_sm_set_enabled(pio0, 0, true);
-#ifdef ENABLE_PSRAM_CACHE
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
     psramPioUnlock(pioLock);
 #endif
 #ifdef DETECT_CONSOLE_TYPE  
@@ -97,12 +96,12 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
     {
         if (events & GPIO_IRQ_EDGE_FALL)
         {
-#ifdef ENABLE_PSRAM_CACHE
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
             uint32_t pioLock = psramPioLock();
 #endif
             pio_sm_set_enabled(pio0, 0, false);
             pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
-#ifdef ENABLE_PSRAM_CACHE
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
             psramPioUnlock(pioLock);
 #endif
         }
@@ -113,11 +112,11 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
             u32 resetTime = time - sResetStart;
             if (resetTime > 700000)
             {
-            #ifdef ENABLE_PSRAM_CACHE
+            #if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
                 uint32_t pioLock2 = psramPioLock();
             #endif
                 pio_sm_set_enabled(pio0, 0, false);
-            #ifdef ENABLE_PSRAM_CACHE
+            #if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
                 psramPioUnlock(pioLock2);
             #endif
             }
@@ -133,10 +132,9 @@ void __scratch_x("cpu1") core1_entry(void)
     scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS;
 #ifdef ENABLE_PSRAM_CACHE
     // Before game mode needs the scrambler, run the PSRAM probe + full-chip
-    // test here on core1. Its bursts use the pio0 ctrl spinlock (not IRQ
-    // shielding), so core0's cart protocol is unaffected. Once gComputeScrambler
-    // goes true, switch to filling the scrambler ring and only interleave test
-    // steps when the ring has enough headroom.
+    // test here on core1. Production PSRAM bursts are pure SIO bit-bang and do
+    // not use pio0 or mask core0 IRQs. Once gComputeScrambler goes true, switch
+    // to filling the ring and only interleave tests when it has headroom.
     while (!gComputeScrambler)
     {
         gScramblerRingWPtr = gScramblerRing;
@@ -240,14 +238,8 @@ int __time_critical_func(main)()
 
     dma_channel_claim(0);
 
-#ifdef ENABLE_PSRAM_CACHE
-    // The pio0 ctrl spinlock must exist before any resetNtrCard()/gpioIrq()
-    // call (both take it around SM0 ctrl writes) and before core1 starts
-    // (core1's PSRAM bursts take it too). Initialize it once, up front -
-    // psram_init_hw() is too late: resetNtrCard() runs first in boot and on
-    // every NDS reset, and psramPioLock() on an un-initialized (NULL) lock
-    // dereferences address 0 (the flash/VTOR base), corrupting state and
-    // crashing the cart protocol on game entry.
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
+    // Only the experimental PSRAM-PIO build shares pio0 across the cores.
     psram_init_lock();
 #endif
 
@@ -383,11 +375,8 @@ int __time_critical_func(main)()
     tryRebootToBootsel();
 
 #ifdef ENABLE_PSRAM_CACHE
-    // romCacheInit() does only the PSRAM hardware init here (GPIO, reset, PIO
-    // SM2/SM3 config, pio0 ctrl spinlock) - the probe and full-chip test run
-    // on core1 (core1_entry). Run it BEFORE pwr_initPowerSaving(): although it
-    // now uses busy_wait_us (not WFI), keeping it before pwr is harmless and
-    // matches the boot ordering.
+    // romCacheInit() configures and resets PSRAM through SIO only; probe and
+    // full-chip test run on core1. No PSRAM PIO program or SM is initialized.
     romCacheInit();
     romCacheSdInit();
 #endif

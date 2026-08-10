@@ -404,9 +404,14 @@ bool romCacheCore1Poll(void)
 #endif
 }
 
+#ifdef ENABLE_UART_LOG
+
 // Count SD cache lines currently holding a valid sector (tag != invalid).
-// Runs on the main loop every heartbeat (16384 reads, still trivial). Used to
-// report PSRAM usage / free space for the SD sector cache.
+// This diagnostic scan must not exist in the no-log firmware: sSdTags is
+// volatile because it is shared with PIO0_IRQ_0, so the compiler cannot remove
+// the 16384 reads even when LOG() expands to a no-op. Running that scan while
+// the loader is mounting the SD card delays gSdCard.Update() enough to make the
+// NDS report "failed to mount sd card".
 static u32 romCacheSdUsedLines(void)
 {
     u32 n = 0;
@@ -423,6 +428,8 @@ static u32 hitRatePermille(u32 hits, u32 misses)
     return total != 0 ? (hits * 1000 + total / 2) / total : 0;
 }
 
+#endif
+
 // core0: forward core1's probe/test outcome to logs and cache state.
 void romCacheUpdate(void)
 {
@@ -431,6 +438,7 @@ void romCacheUpdate(void)
     // main loop (preemptible by PIO0_IRQ_0); see romCacheSdStoreDrain().
     romCacheSdStoreDrain();
 
+#ifdef ENABLE_UART_LOG
     // The probe runs on core1 immediately when sHwInitDone goes true:
     // romCacheInit() does the __sev that wakes core1, so no periodic nudge is
     // needed here. (The main loop is __wfi-driven, but that only matters for
@@ -507,6 +515,7 @@ void romCacheUpdate(void)
                 ", cache stays disabled\n", (u32)sTestFailAddr);
         }
     }
+#endif
 }
 
 #endif
