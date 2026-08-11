@@ -19,6 +19,7 @@
 #include "scramblerRing.h"
 #include "hardware/xosc.h"
 #include "powerSaving.h"
+#include "pioUtil.h"
 #ifdef ENABLE_PSRAM_CACHE
 #include "psram.h"
 #include "romCache.h"
@@ -57,12 +58,9 @@ static void resetNtrCard(void)
     ntrc_resetR4();
 #endif
     dma_channel_abort(0);
-    // Experimental PSRAM-PIO builds share pio0 with SM0 and need the lock.
-    // Production bit-bang builds never touch pio0 from the PSRAM path.
-#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-    uint32_t pioLock = psramPioLock();
-#endif
-    pio_sm_set_enabled(pio0, 0, false);
+    // Use an atomic CTRL alias so reset handling cannot restore a stale enable
+    // state for another PIO0 machine (for example the optional SPI adapter).
+    dspicoPioSmSetEnabled(pio0, 0, false);
     pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
     pio_sm_clear_fifos(pio0, 0);
     pio_sm_restart(pio0, 0);
@@ -70,10 +68,7 @@ static void resetNtrCard(void)
     irq_clear(PIO0_IRQ_0);
     irq_set_enabled(PIO0_IRQ_0, true);
     pio_sm_exec(pio0, 0, pio_encode_jmp(sProgramOffset));
-    pio_sm_set_enabled(pio0, 0, true);
-#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-    psramPioUnlock(pioLock);
-#endif
+    dspicoPioSmSetEnabled(pio0, 0, true);
 #ifdef DETECT_CONSOLE_TYPE  
     setRomToDsiRom();
     gNtrRomEmu.cardId = 0xC00000C2;
@@ -96,14 +91,8 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
     {
         if (events & GPIO_IRQ_EDGE_FALL)
         {
-#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-            uint32_t pioLock = psramPioLock();
-#endif
-            pio_sm_set_enabled(pio0, 0, false);
+            dspicoPioSmSetEnabled(pio0, 0, false);
             pio_sm_set_pindirs_with_mask(pio0, 0, 0, PIN_INPUT_MASK);
-#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-            psramPioUnlock(pioLock);
-#endif
         }
         if (events & GPIO_IRQ_EDGE_RISE)
         {
@@ -112,13 +101,7 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
             u32 resetTime = time - sResetStart;
             if (resetTime > 700000)
             {
-            #if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-                uint32_t pioLock2 = psramPioLock();
-            #endif
-                pio_sm_set_enabled(pio0, 0, false);
-            #if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-                psramPioUnlock(pioLock2);
-            #endif
+                dspicoPioSmSetEnabled(pio0, 0, false);
             }
             sResetStart = time;
         #endif
@@ -132,13 +115,14 @@ void __scratch_x("cpu1") core1_entry(void)
     scb_hw->scr |= M0PLUS_SCR_SLEEPDEEP_BITS;
 #ifdef ENABLE_PSRAM_CACHE
     // Before game mode needs the scrambler, run the PSRAM probe + full-chip
-    // test here on core1. Production PSRAM bursts are pure SIO bit-bang and do
-    // not use pio0 or mask core0 IRQs. Once gComputeScrambler goes true, switch
-    // to filling the ring and only interleave tests when it has headroom.
+    // test here on core1. The same core also services every runtime PSRAM
+    // request (PIO or bit-bang), while core0 remains available for the
+    // cartridge IRQ. Once gComputeScrambler goes true, keep its ring full and
+    // use only the otherwise-idle slots for individual PSRAM bus bursts.
     while (!gComputeScrambler)
     {
         gScramblerRingWPtr = gScramblerRing;
-        if (!romCacheCore1Poll())
+        if (!psram_core1_service() && !romCacheCore1Poll())
         {
             // probe/test done (or terminal): park until game mode.
             __wfe();
@@ -150,7 +134,13 @@ void __scratch_x("cpu1") core1_entry(void)
         u32* next = SCR_RING_WRAP(wPtr + 1);
         if (next == gNtrRomEmu.scrRingRPtr)
         {
-            // ring full: spend the idle slot on the PSRAM test.
+            // The ring is full. Spend one idle slot on one short PSRAM burst,
+            // then re-check/refill the scrambler before the following burst.
+            // This prevents a 512-byte cache hit from starving the encrypted
+            // cartridge data stream for roughly 166 us.
+            if (psram_core1_service())
+                continue;
+
             romCacheCore1Poll();
             __wfe();
             continue;
@@ -216,7 +206,14 @@ static void tryRebootToBootsel(void)
         // instead of silently rebooting into a useless BOOTSEL mode.
         LOG("[BOOT] no SD card mounted, halting (no USB to BOOTSEL-flash)\n");
         while (1)
+        {
+        #ifdef ENABLE_UART_LOG
+            if (!uartLogDrain())
+                __wfe();
+        #else
             __wfi();
+        #endif
+        }
     }
 }
 
@@ -237,11 +234,6 @@ int __time_critical_func(main)()
     set_sys_clock_pll(1200000000, 6, 1);
 
     dma_channel_claim(0);
-
-#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
-    // Only the experimental PSRAM-PIO build shares pio0 across the cores.
-    psram_init_lock();
-#endif
 
     memset(&gNtrRomEmu, 0, sizeof(gNtrRomEmu));
 
@@ -329,7 +321,7 @@ int __time_critical_func(main)()
     pio_gpio_init(pio0, PIN_D6);
     pio_gpio_init(pio0, PIN_D7);
 
-    pio_sm_init(pio0, 0, sProgramOffset, &c);
+    dspicoPioSmInit(pio0, 0, sProgramOffset, &c);
     pio_set_irq0_source_enabled(pio0, pis_sm0_rx_fifo_not_empty, true);
     irq_set_exclusive_handler(PIO0_IRQ_0, ntrc_pioIrq);
 #ifdef DSPICO_ENABLE_WRFUXXED
@@ -352,12 +344,12 @@ int __time_critical_func(main)()
 
 #ifdef ENABLE_UART_LOG
     // Debug UART on GPIO0/1, which the init above does not touch.
-    stdio_init_all();
+    uartLogInit();
 #endif
 
     // Boot banner: the very first thing on the wire. If this does not show
     // up, the problem is UART wiring/baud, not the firmware.
-    LOG("\n[BOOT] DSpico firmware up, sysclk=%lu MHz, UART log OK\n",
+    LOG("\n[BOOT] DSpico firmware up, sysclk=%lu MHz, UART async log OK\n",
         (unsigned long)(clock_get_hz(clk_sys) / 1000000));
     LOG("[BOOT] PSRAM SD cache: %s\n",
     #ifdef ENABLE_PSRAM_CACHE
@@ -366,17 +358,35 @@ int __time_critical_func(main)()
         "not compiled"
     #endif
     );
+#ifdef ENABLE_PSRAM_CACHE
+    LOG("[BOOT] PSRAM backend: %s; E3/E5 cache: %s\n",
+    #if PSRAM_FORCE_BITBANG
+        "bit-bang/core1 burst-interleaved",
+    #else
+        "PIO1 SM2/core1 burst-interleaved",
+    #endif
+    #if PSRAM_CACHE_ENABLE_ON_PROBE
+        "enabled after probe"
+    #else
+        "disabled (probe-only diagnostic)"
+    #endif
+    );
+#endif
 
     resetNtrCard();
     sIsSdCardMounted = false;
     initSd();
     LOG("[BOOT] SD card: %s\n", sIsSdCardMounted ? "mounted" : "not mounted");
+    gSdCard.EnableRuntimeDiagnostics();
 
     tryRebootToBootsel();
 
 #ifdef ENABLE_PSRAM_CACHE
-    // romCacheInit() configures and resets PSRAM through SIO only; probe and
-    // full-chip test run on core1. No PSRAM PIO program or SM is initialized.
+    // SDIO initialization clears and reloads PIO1 instruction memory, so the
+    // PIO1 SM2 PSRAM program must be installed only after the physical SD card
+    // has completed its final high-speed initialization. Core1 qualifies the
+    // PSRAM asynchronously; until it succeeds, all cache lookups safely miss.
+    // The cartridge remains on the independent PIO0 block throughout.
     romCacheInit();
     romCacheSdInit();
 #endif
@@ -402,6 +412,14 @@ int __time_critical_func(main)()
         ntrc_sdCacheFetchDrain();
         romCacheUpdate();
     #endif
+    #ifdef ENABLE_UART_LOG
+        // LOG only queues text. Keep updating SD while the hardware FIFO is
+        // filled in non-blocking pieces; sleep only after the queue empties.
+        // A message queued by core1 wakes this WFE through SEV.
+        if (!uartLogDrain())
+            __wfe();
+    #else
         __wfi();
+    #endif
     }
 }

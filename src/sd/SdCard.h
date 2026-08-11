@@ -17,6 +17,10 @@ public:
     /// @return \c true if the SD card is writing, or \c false otherwise.
     bool IsWriting() const { return _state == State::WriteBegin || _state == State::WriteBusy; }
 
+    /// @brief Starts concise UART tracing for loader-time SD reads. Physical
+    ///        FatFs mount traffic before this call is intentionally omitted.
+    void EnableRuntimeDiagnostics() { _runtimeDiagnostics = true; }
+
     /// @brief Tries to begin a read at the given \p sector and sector \p count. The data will be written to the \p dst buffer.
     /// @param dst The destination buffer.
     /// @param sector The sector to start reading at.
@@ -143,6 +147,9 @@ private:
     volatile u32 _sectorsCompleted;
     u8* _buffer;
     bool _doStopTransmission;
+    bool _runtimeDiagnostics = false;
+    bool _traceCurrentRead = false;
+    u32 _diagnosticReadCount = 0;
     bool _keepSequentialWriteOpen;
     u32 _writeOffset;
 

@@ -244,6 +244,12 @@ void SdCard::StateReadBegin()
 {
     u32 sectorsLeft = _sectorCount - _sectorsCompleted;
     u32 startSector = _sectorAddress + _sectorsCompleted;
+    _traceCurrentRead = _runtimeDiagnostics && ++_diagnosticReadCount <= 8;
+    if (_traceCurrentRead)
+        LOG("[sdio] read#%lu begin sector=%lu count=%lu seq=%u\n",
+            (unsigned long)_diagnosticReadCount, (unsigned long)startSector,
+            (unsigned long)sectorsLeft,
+            (unsigned)(_sequentialState == SequentialState::SequentialRead));
     if (startSector > _lastSdSector)
     {
         _state = State::Idle;
@@ -279,6 +285,9 @@ void SdCard::StateReadBegin()
     {
         StopSequentialReadAlarm();
         rp2040_sdio_rx_continue(_buffer + _sectorsCompleted * 512, sectorsLeft);
+        if (_traceCurrentRead)
+            LOG("[sdio] read#%lu RX continue\n",
+                (unsigned long)_diagnosticReadCount);
         started = true;
     }
     else
@@ -289,6 +298,9 @@ void SdCard::StateReadBegin()
         }
 
         rp2040_sdio_rx_start(_buffer + _sectorsCompleted * 512, sectorsLeft);
+        if (_traceCurrentRead)
+            LOG("[sdio] read#%lu RX armed, sending CMD18\n",
+                (unsigned long)_diagnosticReadCount);
 
         if (_cancelRequested)
         {
@@ -298,14 +310,21 @@ void SdCard::StateReadBegin()
         }
 
         _doStopTransmission = true;
+        u32 commandAttempts = 0;
         while (!_cancelRequested)
         {
+            commandAttempts++;
             if (Cmd18ReadMultipleBlock(sdAddress) == SDIO_OK)
             {
                 started = true;
                 break;
             }
         }
+        if (_traceCurrentRead)
+            LOG("[sdio] read#%lu CMD18 %s attempts=%lu\n",
+                (unsigned long)_diagnosticReadCount,
+                started ? "OK" : "cancelled",
+                (unsigned long)commandAttempts);
     }
 
     if (_cancelRequested && started)
@@ -331,17 +350,27 @@ void SdCard::StateReadBusy()
         case SDIO_BLOCK_CRC_FAIL:
         case SDIO_BLOCK_TIMEOUT:
         {
+            if (_traceCurrentRead)
+                LOG("[sdio] read#%lu block %s, retry\n",
+                    (unsigned long)_diagnosticReadCount,
+                    blockStatus == SDIO_BLOCK_CRC_FAIL ? "CRC fail" : "timeout");
             StopSequentialReadWrite();
             _state = State::ReadBegin; // restart from the failed sector
             break;
         }
         case SDIO_BLOCK_OK:
         {
+            if (_traceCurrentRead)
+                LOG("[sdio] read#%lu block OK\n",
+                    (unsigned long)_diagnosticReadCount);
             _sectorsCompleted++;
             break;
         }
         case SDIO_BLOCK_ALL_DONE:
         {
+            if (_traceCurrentRead)
+                LOG("[sdio] read#%lu all done\n",
+                    (unsigned long)_diagnosticReadCount);
             _sectorsCompleted = _sectorCount;
             _nextSequentialSector = _sectorAddress + _sectorsCompleted;
             _sequentialState = SequentialState::SequentialRead;

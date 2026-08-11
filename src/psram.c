@@ -2,11 +2,12 @@
 #include <stdio.h>
 #include <string.h>
 #include "hardware/gpio.h"
+#include "hardware/sync.h"
 #include "hardware/structs/sio.h"
 #include "psram.h"
 #if !PSRAM_FORCE_BITBANG
 #include "hardware/pio.h"
-#include "hardware/sync.h"
+#include "pioUtil.h"
 #include "psram.pio.h"
 #endif
 
@@ -20,13 +21,18 @@
 
 // The datasheet limits CE# low time to tCEM (max 8 us); longer transfers pause
 // the internal DRAM refresh and can corrupt data. All transfers are therefore
-// split into bursts that complete well within tCEM, including margin for
-// interruptions by the cartridge bus IRQ. Bursts are kept aligned to their
-// size so they never cross a 1K PSRAM page boundary.
-// At clkdiv 3 a 128-byte PIO burst alone takes ~8 us (the RX pump moves one
-// nibble per 12 sysclk), leaving zero IRQ margin - keep PIO bursts at 32 B
-// (~2-4 us) like the bit-bang path.
+// split into bursts that complete well within tCEM. Runtime transactions are
+// executed on core1 so the cartridge IRQ on core0 cannot stretch a CE#-low
+// burst. Bursts are kept aligned to their size so they never cross a 1K PSRAM
+// page boundary.
+// At clkdiv 3 a 128-byte PIO write is already close to the 8 us CE# limit.
+// PIO uses 16-byte bursts so a complete write fits in its joined TX FIFO.
+// Bit-bang uses 32 bytes: reducing it to 16 raised a 512-byte hit fetch from
+// ~120 us to ~187 us and made the loader's E4 deadline fail consistently.
+// Runtime bit-bang is uninterrupted on core1, and every cache hit is protected
+// by the SRAM content digest before E5 can expose it.
 #define PSRAM_BB_BURST_BYTES    32
+#define PSRAM_PIO_PROBE_ROUNDS  128
 
 #define PSRAM_RX_DUMMY_NIBBLES 6
 
@@ -36,77 +42,65 @@
 #define PSRAM_CE_MASK   (1u << PSRAM_PIN_CE)
 
 #if !PSRAM_FORCE_BITBANG
-#define PSRAM_PIO_BURST_BYTES   32
-#define PSRAM_PIO       pio0
+#define PSRAM_PIO_BURST_BYTES   16
+#define PSRAM_PIO       pio1
+#define PSRAM_TX_DONE_IRQ 2
 
-// Spinlock guarding pio0->ctrl read-modify-writes. Both cores touch pio0's
-// state-machine control register: core0's resetNtrCard()/gpioIrq() restart
-// SM0, core1 (PSRAM probe/test) and core0 (cache hit reads) restart SM2/SM3.
-// pio_sm_set_enabled/restart do a read-modify-write of pio->ctrl, so without
-// a lock one core can clobber the other's bit. Replaces the old
-// save_and_disable_interrupts() shielding: that blocked the NDS cart IRQ for
-// ~20 us per burst and caused white screens / "failed to mount SD". The
-// spinlock keeps cart IRQs enabled; only the pio0 ctrl word is serialized.
-static spin_lock_t* sPioLock;
+_Static_assert(sizeof(psram_qspi_command_tx_program_instructions) /
+               sizeof(uint16_t) == 5,
+               "PIO1 layout reserves exactly five words for PSRAM");
 
-void psram_init_lock(void)
+// Serializes complete direct PSRAM transactions. Production PIO cache requests
+// are serviced on core1, but keeping transaction ownership here also protects
+// the core1 probe/test and any early diagnostic call. No IRQ handler takes the
+// lock; cartridge SM0 uses atomic CTRL writes instead (see pioUtil.h).
+static spin_lock_t* volatile sPioTransactionLock;
+
+static inline void psramPioTransactionBegin(void)
 {
-    if (!sPioLock)
-        sPioLock = spin_lock_instance(spin_lock_claim_unused(true));
+    spin_lock_unsafe_blocking(sPioTransactionLock);
 }
 
-static inline uint32_t psramPioLockImpl(void)
+static inline void psramPioTransactionEnd(void)
 {
-    return spin_lock_blocking(sPioLock);
-}
-
-static inline void psramPioUnlockImpl(uint32_t save)
-{
-    spin_unlock(sPioLock, save);
-}
-
-// Exported wrappers for core0 IRQ paths (resetNtrCard/gpioIrq) that cannot
-// see the static inline versions.
-uint32_t psramPioLock(void)
-{
-    return psramPioLockImpl();
-}
-
-void psramPioUnlock(uint32_t save)
-{
-    psramPioUnlockImpl(save);
-}
-#else
-// Production bit-bang builds never share pio0 with PSRAM, so cartridge SM0
-// operations need no cross-core serialization and must not disable IRQs.
-void psram_init_lock(void)
-{
-}
-
-uint32_t psramPioLock(void)
-{
-    return 0;
-}
-
-void psramPioUnlock(uint32_t save)
-{
-    (void)save;
+    spin_unlock_unsafe(sPioTransactionLock);
 }
 #endif
 
+// PIO1 SM0/SM1 implement physical SDIO. Their RX/TX programs dynamically
+// share one instruction region, leaving five words and SM2 for PSRAM. This
+// keeps PSRAM completely off the timing-critical cartridge PIO0 block.
 #if !PSRAM_FORCE_BITBANG
-// pio0 SM0 is the cartridge emulator (ntr_card), SM1 the WRFUXXED SPI-UART;
-// the PSRAM pump takes SM2/SM3.
 #define PSRAM_TX_SM     2
-#define PSRAM_RX_SM     3
 
-// When true, the address/data phases are streamed by two pio0 state machines
-// (psram_qspi_tx/psram_qspi_rx, clkdiv 3 -> SCLK <= sysclk / 6). Falls back to
-// bit-banging when the pio0 resources are unavailable (e.g. WRFUXXED builds).
-static bool sUsePio;
-static uint sTxSm;
-static uint sRxSm;
+// When true, one pio1 state machine emits the complete serial-command plus
+// quad address/write phase (clkdiv 3 -> SCLK ~= sysclk / 6). Read data remains
+// on the proven SIO sampler. Falls back when the reserved five instruction
+// slots are unavailable.
+static volatile bool sUsePio;
+static volatile uint sTxSm;
+static volatile uint sTxOffset;
 #endif
+
+// Every runtime PSRAM transfer, including the production SIO bit-bang path,
+// executes on core1. Core0 submits one request at a time; synchronous reads
+// wait with the cartridge IRQ enabled, while cache backfills return and poll
+// completion later. This is essential for bit-bang: an IRQ on the same
+// core could otherwise pause a live CE#-low transaction beyond tCEM. The probe
+// already runs directly on core1 and therefore uses the same uninterrupted
+// electrical timing.
+enum
+{
+    PSRAM_C1_IDLE = 0,
+    PSRAM_C1_READ,
+    PSRAM_C1_WRITE,
+    PSRAM_C1_DONE,
+};
+static volatile u32 sCore1Request;
+static volatile bool sCore1ServiceReady;
+static u32 sCore1Addr;
+static u32 sCore1Len;
+static void* sCore1Buf;
 
 static inline void psramCeLow(void)
 {
@@ -140,11 +134,11 @@ static void psramMuxToSio(void)
 #if !PSRAM_FORCE_BITBANG
 static void psramMuxToPio(void)
 {
-    gpio_set_function(PSRAM_PIN_IO0, GPIO_FUNC_PIO0);
-    gpio_set_function(PSRAM_PIN_IO1, GPIO_FUNC_PIO0);
-    gpio_set_function(PSRAM_PIN_IO2, GPIO_FUNC_PIO0);
-    gpio_set_function(PSRAM_PIN_IO3, GPIO_FUNC_PIO0);
-    gpio_set_function(PSRAM_PIN_CLK, GPIO_FUNC_PIO0);
+    gpio_set_function(PSRAM_PIN_IO0, GPIO_FUNC_PIO1);
+    gpio_set_function(PSRAM_PIN_IO1, GPIO_FUNC_PIO1);
+    gpio_set_function(PSRAM_PIN_IO2, GPIO_FUNC_PIO1);
+    gpio_set_function(PSRAM_PIN_IO3, GPIO_FUNC_PIO1);
+    gpio_set_function(PSRAM_PIN_CLK, GPIO_FUNC_PIO1);
 }
 #endif
 
@@ -172,149 +166,147 @@ static void psramSendByteSerial(u8 b)
 // ---------------------------------------------------------------------------
 
 #if !PSRAM_FORCE_BITBANG
+static void psramBbReadData(u8* buf, u32 len);
+
 static bool psramPioInit(void)
 {
-    int txOffset = pio_add_program(PSRAM_PIO, &psram_qspi_tx_program);
-    if (txOffset < 0)
+    // SDIO owns PIO1 SM0/SM1 and establishes the shared RX/TX instruction
+    // layout before PSRAM initialization reaches this point.
+    if (pio_sm_is_claimed(PSRAM_PIO, PSRAM_TX_SM))
         return false;
-    int rxOffset = pio_add_program(PSRAM_PIO, &psram_qspi_rx_program);
-    if (rxOffset < 0)
+    if (!pio_can_add_program(PSRAM_PIO, &psram_qspi_command_tx_program))
         return false;
+    uint txOffset = pio_add_program(PSRAM_PIO, &psram_qspi_command_tx_program);
 
-    // The cartridge emulator hardcodes pio0 SM0 (and SM1 in WRFUXXED builds)
-    // WITHOUT registering them with the SDK claim mechanism. Claiming "any
-    // unused SM" would therefore hand the PSRAM pump SM0/SM1 and clobber the
-    // cartridge protocol (observed on hardware: NDS boots the cart, then the
-    // file API dies the moment the PSRAM is initialized). Claim SM2/SM3
-    // explicitly instead.
-    if (pio_sm_is_claimed(PSRAM_PIO, PSRAM_TX_SM) || pio_sm_is_claimed(PSRAM_PIO, PSRAM_RX_SM))
-        return false;
+    // Claim the SM reserved by the PIO1 SDIO/PSRAM layout.
     pio_sm_claim(PSRAM_PIO, PSRAM_TX_SM);
-    pio_sm_claim(PSRAM_PIO, PSRAM_RX_SM);
     sTxSm = PSRAM_TX_SM;
-    sRxSm = PSRAM_RX_SM;
+    sTxOffset = txOffset;
 
-    // TX pump: nibbles from the TX FIFO to IO0-IO3, SCLK on side-set.
-    // clkdiv 3: one nibble takes 2 sm cycles, so SCLK = sysclk / 6 (~33 MHz).
-    pio_sm_config c = psram_qspi_tx_program_get_default_config((uint)txOffset);
+    // One state machine emits the serial command byte on IO0 and then changes
+    // OUT width for the quad address/data phase. IO1-IO3 stay high during the
+    // command. clkdiv 3:
+    // one serial/quad unit takes two SM cycles, SCLK ~= sysclk / 6 (33 MHz).
+    pio_sm_config c = psram_qspi_command_tx_program_get_default_config((uint)txOffset);
     sm_config_set_out_pins(&c, PSRAM_PIN_IO0, 4);
     sm_config_set_in_pins(&c, PSRAM_PIN_IO0);
     sm_config_set_set_pins(&c, PSRAM_PIN_IO0, 4);
     sm_config_set_sideset_pins(&c, PSRAM_PIN_CLK);
     sm_config_set_clkdiv(&c, 3.0f);
     sm_config_set_out_shift(&c, false, true, 32); // MSB (top nibble) first, autopull
-    pio_sm_init(PSRAM_PIO, sTxSm, (uint)txOffset, &c);
+    // The joined 8-word TX FIFO holds a complete 16-byte write burst:
+    // command/address word + four data words. Fill it while SM2 is disabled so
+    // core1 never polls FSTAT or writes TXF2 while SM2 is live.
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    dspicoPioSmInit(PSRAM_PIO, sTxSm, txOffset, &c);
+    pio_sm_set_pins_with_mask(PSRAM_PIO, sTxSm, PSRAM_IO_MASK, PSRAM_IO_MASK);
     pio_sm_set_pindirs_with_mask(PSRAM_PIO, sTxSm, 0, PSRAM_IO_MASK);
     // side-set can only drive pins whose direction is output for this SM;
     // without this SCLK never toggles (pio_sm_set_pins only sets the level)
     pio_sm_set_pindirs_with_mask(PSRAM_PIO, sTxSm, PSRAM_CLK_MASK, PSRAM_CLK_MASK);
     pio_sm_set_pins_with_mask(PSRAM_PIO, sTxSm, 0, PSRAM_CLK_MASK);
 
-    // RX pump: nibbles from IO0-IO3 to the RX FIFO. One nibble takes 4 sm
-    // cycles, so with clkdiv 3 SCLK = sysclk / 12 (~17 MHz). No nibble
-    // counting in the program; the CPU reads exactly len / 4 FIFO words.
-    c = psram_qspi_rx_program_get_default_config((uint)rxOffset);
-    sm_config_set_in_pins(&c, PSRAM_PIN_IO0);
-    sm_config_set_sideset_pins(&c, PSRAM_PIN_CLK);
-    sm_config_set_clkdiv(&c, 3.0f);
-    sm_config_set_in_shift(&c, false, true, 32); // first nibble lands at the top, autopush
-    pio_sm_init(PSRAM_PIO, sRxSm, (uint)rxOffset, &c);
-    pio_sm_set_pindirs_with_mask(PSRAM_PIO, sRxSm, 0, PSRAM_IO_MASK);
-    pio_sm_set_pindirs_with_mask(PSRAM_PIO, sRxSm, PSRAM_CLK_MASK, PSRAM_CLK_MASK);
-    pio_sm_set_pins_with_mask(PSRAM_PIO, sRxSm, 0, PSRAM_CLK_MASK);
-
     return true;
 }
 
-// Starts the TX pump. The first FIFO word is the nibble count - 1, which the
-// program pulls into x itself; the second word is the first stream word. The
-// stream is MSB-nibble first; every 32-bit word holds 8 nibbles.
-static inline void psramTxSmStart(u32 nibbleCount, u32 firstWord)
+// Starts the complete command transmitter. Y is preloaded through two forced
+// instructions while the SM is disabled; the runtime FIFO then contains only
+// the packed command/address/data stream. This avoids spending two of the
+// five available PIO instructions on count loading.
+static inline void psramTxSmStart(u32 quadNibbleCount, u32 firstWord)
 {
     pio_sm_restart(PSRAM_PIO, sTxSm);
     pio_sm_clear_fifos(PSRAM_PIO, sTxSm);
-    pio_sm_put(PSRAM_PIO, sTxSm, nibbleCount - 1);
+    pio_interrupt_clear(PSRAM_PIO, PSRAM_TX_DONE_IRQ);
+
+    // SET can load the fixed eight-bit serial count without consuming FIFO
+    // space. Y is loaded with forced PULL/OUT instructions while disabled.
+    pio_sm_exec_wait_blocking(PSRAM_PIO, sTxSm, pio_encode_set(pio_x, 7));
+    pio_sm_put(PSRAM_PIO, sTxSm, quadNibbleCount - 1);
+    pio_sm_exec_wait_blocking(PSRAM_PIO, sTxSm, pio_encode_pull(false, true));
+    pio_sm_exec_wait_blocking(PSRAM_PIO, sTxSm, pio_encode_out(pio_y, 32));
+
+    // Forced instructions do not reset the normal PC. Always enter at the
+    // serial-command instruction. Set all four lines high before enabling
+    // their output drivers; serial OUT then changes IO0 only, leaving the
+    // three inactive command-phase lines high as required by the PSRAM.
+    pio_sm_exec(PSRAM_PIO, sTxSm, pio_encode_jmp(sTxOffset));
     pio_sm_put(PSRAM_PIO, sTxSm, firstWord);
+    pio_sm_set_pins_with_mask(PSRAM_PIO, sTxSm, PSRAM_IO_MASK, PSRAM_IO_MASK);
     pio_sm_set_pindirs_with_mask(PSRAM_PIO, sTxSm, PSRAM_IO_MASK, PSRAM_IO_MASK);
-    pio_sm_set_enabled(PSRAM_PIO, sTxSm, true);
 }
 
-// Waits for the TX pump to finish (TX FIFO drained, then the remaining
-// in-flight OSR bits shift out) and releases the data bus.
-static inline void psramTxSmWait(void)
+// Starts a fully-prefilled FIFO, waits for the exact completion signal, then
+// releases the bus. PIO1 is shared with SDIO only at the instruction-memory
+// level; PSRAM SM2 has its own pins and completion flag.
+static inline void psramTxSmRunAndWait(void)
 {
-    while (pio_sm_get_tx_fifo_level(PSRAM_PIO, sTxSm) != 0);
-    // at most one OSR word (8 nibbles, 16 sm cycles) is still in flight
-    for (int i = 0; i < 64; i++)
-        __asm volatile ("nop");
-    pio_sm_set_enabled(PSRAM_PIO, sTxSm, false);
+    dspicoPioSmSetEnabled(PSRAM_PIO, sTxSm, true);
+
+    // At 200 MHz / clkdiv 3, the longest 16-byte write is ~1.4 us. A 3 us
+    // quiet interval guarantees IRQ2 is already set in the normal case, so
+    // core1 normally performs only one PIO IRQ read.
+    busy_wait_at_least_cycles(600); // 3 us at the fixed 200 MHz sysclk
+    while (!pio_interrupt_get(PSRAM_PIO, PSRAM_TX_DONE_IRQ))
+        tight_loop_contents();
+    // The program is stalled in IRQ WAIT. Disable it before clearing the flag
+    // so it cannot wrap and emit one extra serial clock edge.
+    dspicoPioSmSetEnabled(PSRAM_PIO, sTxSm, false);
+    pio_interrupt_clear(PSRAM_PIO, PSRAM_TX_DONE_IRQ);
     pio_sm_set_pindirs_with_mask(PSRAM_PIO, sTxSm, 0, PSRAM_IO_MASK);
 }
 
 static void __no_inline_not_in_flash_func(psramPioWriteBurst)(u32 addr, const u8* buf, u32 len)
 {
-    // The whole transaction runs under the pio0 ctrl spinlock (NOT
-    // save_and_disable_interrupts): the PSRAM protocol needs CE# low ->
-    // command -> address -> data continuous, and pio0 ctrl read-modify-writes
-    // must be serialized across cores. The spinlock keeps the NDS cart IRQ
-    // enabled, so unlike the old IRQ-shielding this does not stall the cart
-    // protocol. The lock is held only for the few-us pio0 portion.
-    psramMuxToSio();
-    psramClkLow();
-    psramCeLow();
-    psramSendByteSerial(PSRAM_CMD_QUAD_WRITE);
-
-    uint32_t save = psramPioLock();
+    // Own the PSRAM pins and chip for the complete CE#-low transaction. The
+    // unsafe lock does not alter PRIMASK. Runtime PIO requests execute on
+    // core1, independently of the cartridge's PIO0 SM0 and IRQ handler.
+    psramPioTransactionBegin();
     psramMuxToPio();
-    psramTxSmStart(6 + 2 * len, (addr << 8) | buf[0]);
-    for (u32 off = 1; off < len; off += 4)
+
+    // The first FIFO word is exactly command byte + 24-bit address. All data
+    // follows on a word boundary, unlike the old SIO-command/PIO-address split.
+    psramTxSmStart(6 + 2 * len,
+                   ((u32)PSRAM_CMD_QUAD_WRITE << 24) | (addr & 0x00FFFFFFu));
+    for (u32 off = 0; off < len; off += 4)
     {
         u32 w = 0;
         for (u32 k = 0; k < 4 && off + k < len; k++)
             w |= (u32)buf[off + k] << (24 - 8 * k);
-        pio_sm_put_blocking(PSRAM_PIO, sTxSm, w);
+        // Entire transaction fits in the joined FIFO before SM2 starts.
+        pio_sm_put(PSRAM_PIO, sTxSm, w);
     }
-    psramTxSmWait();
+    // FIFO/register setup happens with CE# high; only the autonomous PIO wire
+    // phase counts against the PSRAM's 8 us maximum CE#-low interval.
+    psramCeLow();
+    psramTxSmRunAndWait();
     psramMuxToSio();
-    psramPioUnlock(save);
-
     psramCeHigh();
+    psramPioTransactionEnd();
 }
 
 static void __no_inline_not_in_flash_func(psramPioReadBurst)(u32 addr, u8* buf, u32 len)
 {
-    // See psramPioWriteBurst: full transaction under the pio0 ctrl spinlock.
-    psramMuxToSio();
-    psramClkLow();
-    psramCeLow();
-    psramSendByteSerial(PSRAM_CMD_FAST_READ_QUAD);
-
-    uint32_t save = psramPioLock();
-    // address + dummy clocks via the TX pump. The address word's 2 spare
-    // bottom nibbles are zeros and serve as the first 2 dummy clocks; a zero
-    // word provides the remaining 4.
+    // See psramPioWriteBurst: the transaction lock leaves cartridge IRQs on.
+    psramPioTransactionBegin();
     psramMuxToPio();
-    psramTxSmStart(6 + PSRAM_RX_DUMMY_NIBBLES, addr << 8);
-    pio_sm_put_blocking(PSRAM_PIO, sTxSm, 0);
-    psramTxSmWait();
 
-    // data via the RX pump; the FIFO words are big-endian, hence the bswap.
-    // The program free-runs (no nibble count): read exactly len / 4 words,
-    // then disable the SM.
-    pio_sm_restart(PSRAM_PIO, sRxSm);
-    pio_sm_clear_fifos(PSRAM_PIO, sRxSm);
-    pio_sm_set_enabled(PSRAM_PIO, sRxSm, true);
-    u32* w = (u32*)buf;
-    for (u32 i = 0; i < len / 4; i++)
-    {
-        w[i] = __builtin_bswap32(pio_sm_get_blocking(PSRAM_PIO, sRxSm));
-    }
-    pio_sm_set_enabled(PSRAM_PIO, sRxSm, false);
+    // The same SM emits the serial 0xEB command, quad address and six dummy
+    // clocks without a mid-command GPIO mux handoff.
+    psramTxSmStart(6 + PSRAM_RX_DUMMY_NIBBLES,
+                   ((u32)PSRAM_CMD_FAST_READ_QUAD << 24) | (addr & 0x00FFFFFFu));
+    pio_sm_put(PSRAM_PIO, sTxSm, 0);
+    psramCeLow();
+    psramTxSmRunAndWait();
 
+    // First architecture test keeps the proven SIO sampler for returned data.
+    // PIO leaves SCLK low after the final dummy falling edge, so the first SIO
+    // rising edge samples the first data nibble normally.
     psramMuxToSio();
-    psramPioUnlock(save);
-
+    sio_hw->gpio_oe_clr = PSRAM_IO_MASK;
+    psramBbReadData(buf, len);
     psramCeHigh();
+    psramPioTransactionEnd();
 }
 #endif
 
@@ -345,6 +337,18 @@ static inline u8 psramBbRecvNibble(void)
     return nibble;
 }
 
+// Receive only the quad data phase of an already-open CE# transaction. Used
+// by both the all-bit-bang reader and the PIO1 SM2 command architecture.
+static void psramBbReadData(u8* buf, u32 len)
+{
+    for (u32 i = 0; i < len; i++)
+    {
+        u8 hi = psramBbRecvNibble();
+        u8 lo = psramBbRecvNibble();
+        buf[i] = (hi << 4) | lo;
+    }
+}
+
 static void __no_inline_not_in_flash_func(psramBbReadBurst)(u32 addr, u8* buf, u32 len)
 {
     psramClkLow();
@@ -368,12 +372,7 @@ static void __no_inline_not_in_flash_func(psramBbReadBurst)(u32 addr, u8* buf, u
         psramClkLow();
     }
 
-    for (u32 i = 0; i < len; i++)
-    {
-        u8 hi = psramBbRecvNibble();
-        u8 lo = psramBbRecvNibble();
-        buf[i] = (hi << 4) | lo;
-    }
+    psramBbReadData(buf, len);
     psramCeHigh();
 }
 
@@ -403,7 +402,7 @@ static void __no_inline_not_in_flash_func(psramBbWriteBurst)(u32 addr, const u8*
 // Public API
 // ---------------------------------------------------------------------------
 
-void psram_read(u32 addr, void* buf, u32 len)
+static void psramReadDirect(u32 addr, void* buf, u32 len)
 {
 #if PSRAM_FORCE_BITBANG
     u8* dst = (u8*)buf;
@@ -419,8 +418,8 @@ void psram_read(u32 addr, void* buf, u32 len)
         len -= burst;
     }
 #else
-    // The PIO path streams whole 32-bit words, so address and length must be
-    // word aligned; anything else goes through the bit-bang path.
+    // Cache/probe traffic is word aligned. Keep odd diagnostic accesses on the
+    // all-bit-bang path so the PIO write FIFO never needs cross-call packing.
     bool usePio = sUsePio && ((addr | len) & 3) == 0;
     u8* dst = (u8*)buf;
     while (len > 0)
@@ -442,7 +441,7 @@ void psram_read(u32 addr, void* buf, u32 len)
 #endif
 }
 
-void psram_write(u32 addr, const void* buf, u32 len)
+static void psramWriteDirect(u32 addr, const void* buf, u32 len)
 {
 #if PSRAM_FORCE_BITBANG
     const u8* src = (const u8*)buf;
@@ -479,6 +478,127 @@ void psram_write(u32 addr, const void* buf, u32 len)
 #endif
 }
 
+static void psramSubmitCore1(u32 request, u32 addr, void* buf, u32 len)
+{
+    // Only the core0 main loop submits requests, and it never has more than
+    // one cache drain in flight. PIO0_IRQ_0 may preempt this wait, but IRQ
+    // handlers never call the PSRAM API.
+    while (sCore1Request != PSRAM_C1_IDLE)
+        tight_loop_contents();
+
+    sCore1Addr = addr;
+    sCore1Buf = buf;
+    sCore1Len = len;
+    __dmb();
+    sCore1Request = request;
+    __sev();
+
+    while (sCore1Request != PSRAM_C1_DONE)
+        __wfe();
+    __dmb();
+    sCore1Request = PSRAM_C1_IDLE;
+}
+
+bool psram_core1_async_write(u32 addr, const void* buf, u32 len)
+{
+    if (!sCore1ServiceReady || get_core_num() != 0 ||
+        sCore1Request != PSRAM_C1_IDLE)
+        return false;
+
+    sCore1Addr = addr;
+    sCore1Buf = (void*)buf;
+    sCore1Len = len;
+    __dmb();
+    sCore1Request = PSRAM_C1_WRITE;
+    __sev();
+    return true;
+}
+
+bool psram_core1_async_finish(void)
+{
+    if (sCore1Request != PSRAM_C1_DONE)
+        return false;
+    __dmb();
+    sCore1Request = PSRAM_C1_IDLE;
+    return true;
+}
+
+bool psram_core1_async_idle(void)
+{
+    return sCore1Request == PSRAM_C1_IDLE;
+}
+
+void psram_read(u32 addr, void* buf, u32 len)
+{
+    if (sCore1ServiceReady && get_core_num() == 0)
+    {
+        psramSubmitCore1(PSRAM_C1_READ, addr, buf, len);
+        return;
+    }
+    psramReadDirect(addr, buf, len);
+}
+
+void psram_write(u32 addr, const void* buf, u32 len)
+{
+    if (sCore1ServiceReady && get_core_num() == 0)
+    {
+        psramSubmitCore1(PSRAM_C1_WRITE, addr, (void*)buf, len);
+        return;
+    }
+    psramWriteDirect(addr, buf, len);
+}
+
+bool psram_core1_service(void)
+{
+    // Called at the head of both core1 loops. Publishing readiness here keeps
+    // standalone early core0 calls on the direct path until a consumer exists.
+    if (!sCore1ServiceReady)
+    {
+        __dmb();
+        sCore1ServiceReady = true;
+    }
+
+    u32 request = sCore1Request;
+    if (request != PSRAM_C1_READ && request != PSRAM_C1_WRITE)
+        return false;
+
+    __dmb();
+
+    // Service exactly one electrical burst per call. During game mode core1
+    // also produces the cartridge scrambler stream; monopolising it for an
+    // entire 512-byte cache line (about 166 us on the SIO backend) can empty
+    // that ring and corrupt the next encrypted ROM response. The core1 loop
+    // refills the ring between these short PSRAM bursts.
+#if PSRAM_FORCE_BITBANG
+    const u32 burstBytes = PSRAM_BB_BURST_BYTES;
+#else
+    // An unaligned diagnostic request will fall back to SIO inside the direct
+    // helper. A 16-byte slice is still one safe SIO transaction in that case.
+    const u32 burstBytes = sUsePio ? PSRAM_PIO_BURST_BYTES
+                                   : PSRAM_BB_BURST_BYTES;
+#endif
+    u32 chunk = burstBytes - (sCore1Addr & (burstBytes - 1));
+    if (chunk > sCore1Len)
+        chunk = sCore1Len;
+
+    if (request == PSRAM_C1_READ)
+        psramReadDirect(sCore1Addr, sCore1Buf, chunk);
+    else
+        psramWriteDirect(sCore1Addr, sCore1Buf, chunk);
+
+    sCore1Addr += chunk;
+    sCore1Buf = (u8*)sCore1Buf + chunk;
+    sCore1Len -= chunk;
+
+    if (sCore1Len != 0)
+        return true;
+
+    __dmb();
+    sCore1Request = PSRAM_C1_DONE;
+    __sev();
+    return true;
+}
+
 static void psramSendCmd(u8 cmd)
 {
     psramClkLow();
@@ -487,58 +607,84 @@ static void psramSendCmd(u8 cmd)
     psramCeHigh();
 }
 
-// Quick presence probe: write address-dependent patterns at the start,
-// middle and end of the address space and read them back. Fails fast when
-// no PSRAM is fitted, in which case the caller must not use the PSRAM.
-// The exhaustive full-chip test runs in the background from
-// romCacheUpdate() - it must not block boot: the cartridge protocol is
-// served from the main loop, and the console gives up on the cart within
-// a fraction of a second.
+// Return the chip and bus to a known SPI-mode state. This is also required
+// after a failed PIO qualification: merely changing the GPIO mux does not
+// guarantee that the last malformed CE#-low transaction left the PSRAM command
+// decoder on a byte boundary.
+static void psramResetChipSio(void)
+{
+    psramMuxToSio();
+    sio_hw->gpio_oe_clr = PSRAM_IO_MASK;
+    psramCeHigh();
+    psramClkLow();
+    busy_wait_us(1);
+    psramSendCmd(PSRAM_CMD_RESET_ENABLE);
+    psramSendCmd(PSRAM_CMD_RESET);
+    busy_wait_us(50);
+}
+
+// Presence/data-path probe at the start, middle and end of the address space.
+// The PIO backend is stress-tested because a single successful transfer is not
+// enough to qualify a timing-sensitive pump; any PIO mismatch forces the
+// known-good bit-bang fallback. Bit-bang retains retries for presence testing.
 static bool psramProbe(void)
 {
-    for (u32 addr = 0; addr < PSRAM_SIZE_BYTES; addr += (PSRAM_SIZE_BYTES / 2) - PSRAM_BB_BURST_BYTES)
-    {
-        u8 pattern[PSRAM_BB_BURST_BYTES];
-        u8 readBack[PSRAM_BB_BURST_BYTES];
-        for (u32 i = 0; i < sizeof(pattern); i++)
-            pattern[i] = (u8)(addr + i * 0x9Du + 0x35u);
-
-        // Retry a few times: the console boots in parallel and its reset
-        // pulses can disturb a transfer even with the IRQ shielding.
-        bool ok = false;
-        for (int attempt = 0; attempt < 3 && !ok; attempt++)
-        {
-            psram_write(addr, pattern, sizeof(pattern));
-            psram_read(addr, readBack, sizeof(readBack));
-            ok = memcmp(pattern, readBack, sizeof(pattern)) == 0;
-        }
-        if (!ok)
-        {
-            LOG("PSRAM: probe FAILED @0x%08lX wrote[0:4]=", addr);
-            for (u32 i = 0; i < 4; i++) LOG("%02X", pattern[i]);
-            LOG(" read[0:4]=");
-            for (u32 i = 0; i < 4; i++) LOG("%02X", readBack[i]);
-            LOG("\n");
+    u32 rounds = 1;
+    int attempts = 3;
 #if !PSRAM_FORCE_BITBANG
-            if (sUsePio)
-            {
-                // Cross-check with the known-good bit-bang path, same as the
-                // dspico-debug harness: pioW->bbR shows what the PIO write
-                // actually stored, bbW->pioR isolates the PIO read pump.
-                u8 xbuf[8];
-                psramBbReadBurst(addr, xbuf, 8);
-                LOG("PSRAM: pioW->bbR[0:8]=");
-                for (u32 i = 0; i < 8; i++) LOG("%02X", xbuf[i]);
-                LOG("\n");
-                psramBbWriteBurst(addr, pattern, 8);
-                memset(xbuf, 0, 8);
-                psramPioReadBurst(addr, xbuf, 8);
-                LOG("PSRAM: bbW->pioR[0:8]=");
-                for (u32 i = 0; i < 8; i++) LOG("%02X", xbuf[i]);
-                LOG("\n");
-            }
+    if (sUsePio)
+    {
+        rounds = PSRAM_PIO_PROBE_ROUNDS;
+        attempts = 1;
+    }
 #endif
-            return false;
+
+    for (u32 round = 0; round < rounds; round++)
+    {
+        for (u32 addr = 0; addr < PSRAM_SIZE_BYTES;
+             addr += (PSRAM_SIZE_BYTES / 2) - PSRAM_BB_BURST_BYTES)
+        {
+            u8 pattern[PSRAM_BB_BURST_BYTES];
+            u8 readBack[PSRAM_BB_BURST_BYTES];
+            for (u32 i = 0; i < sizeof(pattern); i++)
+                pattern[i] = (u8)(addr + i * 0x9Du + 0x35u + round * 0x53u);
+
+            bool ok = false;
+            for (int attempt = 0; attempt < attempts && !ok; attempt++)
+            {
+                psramWriteDirect(addr, pattern, sizeof(pattern));
+                psramReadDirect(addr, readBack, sizeof(readBack));
+                ok = memcmp(pattern, readBack, sizeof(pattern)) == 0;
+            }
+            if (!ok)
+            {
+                LOG("PSRAM: probe FAILED round=%lu @0x%08lX wrote[0:4]=",
+                    (unsigned long)round, (unsigned long)addr);
+                for (u32 i = 0; i < 4; i++) LOG("%02X", pattern[i]);
+                LOG(" read[0:4]=");
+                for (u32 i = 0; i < 4; i++) LOG("%02X", readBack[i]);
+                LOG("\n");
+#if !PSRAM_FORCE_BITBANG
+                if (sUsePio)
+                {
+                    // pioW->bbR validates complete PIO writes. The reciprocal
+                    // test validates the new PIO command/address phase followed
+                    // by the proven bit-bang data sampler.
+                    u8 xbuf[8];
+                    psramBbReadBurst(addr, xbuf, 8);
+                    LOG("PSRAM: pioW->bbR[0:8]=");
+                    for (u32 i = 0; i < 8; i++) LOG("%02X", xbuf[i]);
+                    LOG("\n");
+                    psramBbWriteBurst(addr, pattern, 8);
+                    memset(xbuf, 0, 8);
+                    psramPioReadBurst(addr, xbuf, 8);
+                    LOG("PSRAM: bbW->pioCmdBbR[0:8]=");
+                    for (u32 i = 0; i < 8; i++) LOG("%02X", xbuf[i]);
+                    LOG("\n");
+                }
+#endif
+                return false;
+            }
         }
     }
     return true;
@@ -567,18 +713,18 @@ void psram_init_hw(void)
     busy_wait_us(200);
 
     // Software reset (RSTEN must be immediately followed by RST).
-    psramSendCmd(PSRAM_CMD_RESET_ENABLE);
-    psramSendCmd(PSRAM_CMD_RESET);
-    busy_wait_us(50);
+    psramResetChipSio();
 
 #if PSRAM_FORCE_BITBANG
     // Production path: keep every PSRAM pin on SIO. The PSRAM PIO program is
-    // not generated or linked, and pio0 SM2/SM3 remain untouched.
+    // not generated or linked, and PIO1 SM2 remains unclaimed.
     psramMuxToSio();
     LOG("PSRAM: hw init done (bit-bang ready)\n");
 #else
+    if (!sPioTransactionLock)
+        sPioTransactionLock = spin_lock_instance(spin_lock_claim_unused(true));
     sUsePio = psramPioInit();
-    LOG("PSRAM: hw init done (%s ready)\n", sUsePio ? "PIO" : "bit-bang");
+    LOG("PSRAM: hw init done (%s ready)\n", sUsePio ? "PIO1 SM2" : "bit-bang");
 #endif
 }
 
@@ -587,18 +733,24 @@ void psram_init_hw(void)
 bool psram_probe(void)
 {
 #if PSRAM_FORCE_BITBANG
-    LOG("PSRAM: probing (bit-bang path)...\n");
+    LOG("PSRAM: probing (bit-bang path, core1 runtime service)...\n");
     if (psramProbe())
     {
-        LOG("PSRAM: bit-bang data path\n");
+        LOG("PSRAM: bit-bang data path (uninterrupted core1 service)\n");
         return true;
     }
     return false;
 #else
-    LOG("PSRAM: probing (%s path)...\n", sUsePio ? "PIO" : "bit-bang");
+    if (sUsePio)
+        LOG("PSRAM: probing (PIO1 SM2 command/write + SIO read, 128-round stress)...\n");
+    else
+        LOG("PSRAM: probing (bit-bang path)...\n");
     if (psramProbe())
     {
-        LOG("PSRAM: %s data path\n", sUsePio ? "PIO" : "bit-bang");
+        if (sUsePio)
+            LOG("PSRAM: PIO1 SM2 command/write + SIO read data path (core1 service)\n");
+        else
+            LOG("PSRAM: bit-bang data path\n");
         return true;
     }
 
@@ -607,10 +759,12 @@ bool psram_probe(void)
     if (sUsePio)
     {
         LOG("PSRAM: PIO probe failed, retrying with bit-bang...\n");
-        pio_sm_set_enabled(PSRAM_PIO, sTxSm, false);
-        pio_sm_set_enabled(PSRAM_PIO, sRxSm, false);
+        dspicoPioSmSetEnabled(PSRAM_PIO, sTxSm, false);
         sUsePio = false;
-        psramMuxToSio();
+        // The failed write may have ended with a malformed command/address
+        // phase. Reset the chip before trusting the bit-bang fallback; a mux
+        // switch alone cannot repair the PSRAM command decoder state.
+        psramResetChipSio();
         if (psramProbe())
         {
             LOG("PSRAM: bit-bang data path\n");

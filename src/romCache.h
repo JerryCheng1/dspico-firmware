@@ -27,16 +27,13 @@ bool romCacheIsAvailable(void);
 // on E3 (hit -> serve from PSRAM, skip the SD read) and backfilled on E5 (a
 // sector served from the SD is stored for re-reads).
 //
-// All PSRAM access is ASYNC: the E5 IRQ handler only does a ~1 us memcpy and
-// sets a pending flag; the actual psram_write runs in romCacheSdStoreDrain()
-// on the core0 main loop, which PIO0_IRQ_0 can preempt. Doing the ~112 us /
-// 1 ms PSRAM access inside the IRQ handler blocks PIO0_IRQ_0 (SM0 stages the
-// next command word in its RX FIFO but the handler has not returned) and the
-// NDS stalls -> "failed to mount SD card". The bit-bang path (no pio0 SM,
-// no spinlock, no IRQ disable) is safe on core0 and is used for ALL cache
-// access; the PIO pump is used only for the core1 probe (where the spinlock
-// disabling interrupts is harmless - it disables core1's IRQs, not core0's).
-// See romCache.c for the full rationale.
+// All PSRAM access is ASYNC: the E5 IRQ handler only does a short memcpy and
+// sets a pending flag; romCacheSdStoreDrain() submits the actual write to
+// core1 without waiting. Core0 continues advancing the SDIO state machine and
+// publishes the cache tag only after a later completion poll. Doing the slow
+// PSRAM access inside the IRQ handler, or synchronously waiting for it on the
+// main loop, starves loader-time SD progress and can cause "failed to mount SD
+// card". See romCache.c and PSRAM-PIO-HANDOVER.md for the full rationale.
 //
 // The HIT path is async too: romCacheSdCheckHit() (E3 IRQ) only reads the tag
 // array and increments counters (~1 us, no PSRAM access); the actual
@@ -45,9 +42,11 @@ bool romCacheIsAvailable(void);
 //
 // The tag table (sSdTags) lives in SRAM, NOT PSRAM: the E3 IRQ handler must
 // resolve a hit/miss in nanoseconds (one LDR). A PSRAM tag read would cost a
-// full ~10-20 us bit-bang transaction (cmd+addr+dummy) inside PIO0_IRQ_0 -
+// full external-memory transaction inside PIO0_IRQ_0 -
 // exactly the blackout that breaks the cart protocol. 16384 lines * 4 B =
-// 64 KB of SRAM; the data (16384 * 512 B = 8 MB) fills the PSRAM.
+// 64 KB of SRAM, plus a 32 KB 16-bit integrity-digest table. The data
+// (16384 * 512 B = 8 MB) fills the PSRAM. A digest mismatch invalidates the
+// line and forces a physical-SD fallback before E4 reports it ready.
 #define SD_CACHE_LINE_SIZE   512
 #define SD_CACHE_LINE_SHIFT  9
 #define SD_CACHE_NUM_LINES   (PSRAM_SIZE_BYTES / SD_CACHE_LINE_SIZE) // 16384
@@ -64,7 +63,9 @@ void romCacheSdInit(void);
 bool romCacheSdCheckHit(u32 sector);
 
 /// @brief Reads the cached 512 B SD sector at \p sector from PSRAM into \p dst.
-///        Main-loop ONLY (bit-bang psram_read, ~64 us, preemptible, no lock);
+///        Main-loop ONLY (the transfer runs on core1 while core0 remains
+///        IRQ-ready). Returns false to use physical SD if an async backfill
+///        already owns the core1 worker;
 ///        must NOT be called from PIO0_IRQ_0. The caller must have confirmed a
 ///        hit via romCacheSdCheckHit() immediately before (single sector in
 ///        flight on the main loop guarantees the tag stays valid).
@@ -75,16 +76,16 @@ bool romCacheSdReadCached(u32 sector, u8* dst);
 
 /// @brief Queues the 512 B SD sector at \p sector for async storage.
 ///        Called from the E5 PIO0_IRQ_0 handler: copies \p src into an
-///        internal buffer and marks it pending. The actual psram_write is
-///        performed later by romCacheSdStoreDrain() on the main loop. If a
-///        previous store is still pending the new one is dropped.
+///        internal buffer and marks it pending. romCacheSdStoreDrain() later
+///        submits a non-blocking core1 write. If a previous store is still
+///        pending or in flight the new one is dropped.
 /// @param sector The SD LBA.
 /// @param src Source buffer of SD_CACHE_LINE_SIZE bytes.
 void romCacheSdStore(u32 sector, const u8* src);
 
-/// @brief Performs any pending async SD-sector store (psram_write). Call from
-///        the core0 main loop (e.g. romCacheUpdate); must NOT be called from
-///        PIO0_IRQ_0. Preemptible by the cart IRQ.
+/// @brief Submits or polls a pending asynchronous core1 SD-sector store. Call
+///        from the core0 main loop (e.g. romCacheUpdate); never waits and must
+///        NOT be called from PIO0_IRQ_0.
 void romCacheSdStoreDrain(void);
 
 /// @brief Invalidates all SD sector cache lines.

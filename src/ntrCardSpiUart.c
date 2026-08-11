@@ -4,6 +4,7 @@
 #include "ntrCard.pio.h"
 #include "wrfuxxed.h"
 #include "ntrCardSpiUart.h"
+#include "pioUtil.h"
 
 #ifdef DSPICO_ENABLE_WRFUXXED
 
@@ -109,16 +110,16 @@ void ntrc_initSpiUart(u32 programOffs)
     sm_config_set_clkdiv(&c, 1);
     pio_sm_set_pindirs_with_mask(pio0, 1, 0, 0xC0000);
     pio_sm_set_pins_with_mask(pio0, 1, 0, 0xC0000);
-    pio_sm_init(pio0, 1, programOffs, &c);
+    dspicoPioSmInit(pio0, 1, programOffs, &c);
     pio_set_irq1_source_enabled(pio0, pis_sm1_rx_fifo_not_empty, true);
     irq_set_exclusive_handler(PIO0_IRQ_1, dataIrq);
-    pio_sm_set_enabled(pio0, 1, true);
+    dspicoPioSmSetEnabled(pio0, 1, true);
     ntrc_resetSpiUart();
 }
 
 void ntrc_resetSpiUart(void)
 {
-    pio_sm_set_enabled(pio0, 1, false);
+    dspicoPioSmSetEnabled(pio0, 1, false);
 
     sState.status = 0x80;
     sState.retDataPtr = 0;
@@ -134,7 +135,7 @@ void ntrc_resetSpiUart(void)
     irq_clear(PIO0_IRQ_1);
     irq_set_enabled(PIO0_IRQ_1, true);
     pio_sm_exec(pio0, 1, pio_encode_jmp(sState.progOffs));
-    pio_sm_set_enabled(pio0, 1, true);
+    dspicoPioSmSetEnabled(pio0, 1, true);
     pio0->txf[1] = 0x80 << 24; //put first byte
 }
 

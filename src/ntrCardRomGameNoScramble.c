@@ -13,8 +13,8 @@ void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* p
     //do not receive further commands until card reset
     irq_set_enabled(PIO0_IRQ_0, false);
 
-    puts("Unknown game command");
-    printf("%08" PRIX32 "%08" PRIX32 "\n", romEmu->cmd0, romEmu->cmd1);
+    LOG("Unknown game command %08" PRIX32 "%08" PRIX32 "\n",
+        romEmu->cmd0, romEmu->cmd1);
 }
 
 void __time_critical_func(ntrc_gameNoScrambleCmd0Dummy)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)

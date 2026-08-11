@@ -1,8 +1,8 @@
 #pragma once
 #include "common.h"
 
-// The production configuration uses only SIO bit-banging for external PSRAM.
-// CMake defines this explicitly; keep the safe default for standalone builds.
+// Production and standalone builds use the proven bit-bang backend. CMake can
+// explicitly select the experimental PIO backend for diagnostics.
 #ifndef PSRAM_FORCE_BITBANG
 #define PSRAM_FORCE_BITBANG 1
 #endif
@@ -28,18 +28,11 @@ extern "C" {
 #define PSRAM_SIZE_BYTES    (8 * 1024 * 1024)
 
 /// @brief Hardware init only (GPIO and reset). No bursts/probe.
-///        Safe during NDS boot. PIO setup exists only in experimental builds.
+///        Call after physical SD initialization. Falls back to bit-bang if
+///        the reserved PIO1 SM2/instruction region is unavailable.
 void psram_init_hw(void);
 
-/// @brief Initializes the pio0 serialization lock in experimental PIO builds.
-///        The production bit-bang build does not call these helpers.
-void psram_init_lock(void);
-
-/// @brief Experimental PIO-build serialization helpers.
-uint32_t psramPioLock(void);
-void psramPioUnlock(uint32_t save);
-
-/// @brief Probes PSRAM with bit-bang bursts. Run on core1.
+/// @brief Probes PSRAM through the selected backend. Run on core1.
 bool psram_probe(void);
 
 /// @brief hw init + probe. Only when probe's bursts are safe (not during boot).
@@ -50,6 +43,25 @@ void psram_read(u32 addr, void* buf, u32 len);
 
 /// @brief Writes \p len bytes from \p buf to PSRAM \p addr.
 void psram_write(u32 addr, const void* buf, u32 len);
+
+/// @brief Starts one non-blocking core1 write. The source buffer must remain
+///        valid until psram_core1_async_finish() returns true.
+/// @return true when the request was accepted; false while the worker is busy
+///         or has not started yet.
+bool psram_core1_async_write(u32 addr, const void* buf, u32 len);
+
+/// @brief Completes an accepted asynchronous request and releases the worker.
+/// @return true once core1 has finished the transfer; false while still busy.
+bool psram_core1_async_finish(void);
+
+/// @brief Returns whether no asynchronous/synchronous core1 request is active.
+bool psram_core1_async_idle(void);
+
+/// @brief Core1 worker for all queued runtime transfers, including bit-bang.
+///        Each call performs at most one bus burst so game-mode callers can
+///        refill other timing-critical core1 work between bursts.
+/// @return true if one burst of a queued transfer was serviced.
+bool psram_core1_service(void);
 
 #ifdef __cplusplus
 }

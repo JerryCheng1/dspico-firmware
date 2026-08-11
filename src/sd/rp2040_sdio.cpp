@@ -16,6 +16,11 @@
 #include <hardware/dma.h>
 #include <hardware/gpio.h>
 #include <hardware/structs/scb.h>
+#include "../pioUtil.h"
+
+#ifndef PSRAM_FORCE_BITBANG
+#define PSRAM_FORCE_BITBANG 1
+#endif
 
 #define azdbg(...)
 #define azlog(...)
@@ -25,6 +30,48 @@
 #define SDIO_DATA_SM 1
 #define SDIO_DMA_CH 2
 #define SDIO_DMA_CHB 3
+
+#if !PSRAM_FORCE_BITBANG
+static_assert(sizeof(sdio_cmd_clk_program_instructions) / sizeof(uint16_t) == 18,
+              "PIO1 layout requires the 18-word SDIO command program");
+static_assert(sizeof(sdio_data_rx_program_instructions) / sizeof(uint16_t) == 5,
+              "PIO1 layout requires the 5-word SDIO RX program");
+static_assert(sizeof(sdio_data_tx_program_instructions) / sizeof(uint16_t) == 9,
+              "PIO1 layout requires the 9-word SDIO TX program");
+
+// PIO1 instruction layout in the experimental PSRAM build:
+//   14..31  SDIO command/clock (18 words, always resident)
+//    5..13  SDIO RX or TX data program (dynamically selected)
+//    0..4   PSRAM command/write pump on SM2
+// RX is 5 words and TX is 9 words, but only one can run on SDIO SM1 at a
+// time. Giving both the same 9-word slot makes room for PSRAM without moving
+// either peripheral onto the cartridge's timing-critical PIO0 block.
+#define SDIO_DATA_PROGRAM_OFFSET 5u
+enum class SdioDataProgram : uint8_t { None, Rx, Tx };
+static SdioDataProgram sLoadedDataProgram = SdioDataProgram::None;
+#endif
+
+// Preserve the SDK's original SDIO behavior in the production bit-bang
+// build. The PIO PSRAM build needs atomic CTRL updates because SDIO SM0/SM1
+// on core0 and PSRAM SM2 on core1 can change their enable bits concurrently.
+static inline void sdio_sm_set_enabled(uint sm, bool enabled)
+{
+#if !PSRAM_FORCE_BITBANG
+    dspicoPioSmSetEnabled(SDIO_PIO, sm, enabled);
+#else
+    pio_sm_set_enabled(SDIO_PIO, sm, enabled);
+#endif
+}
+
+static inline void sdio_sm_init(uint sm, uint initialPc,
+                                const pio_sm_config* config)
+{
+#if !PSRAM_FORCE_BITBANG
+    dspicoPioSmInit(SDIO_PIO, sm, initialPc, config);
+#else
+    pio_sm_init(SDIO_PIO, sm, initialPc, config);
+#endif
+}
 
 // Maximum number of 512 byte blocks to transfer in one request
 #define SDIO_MAX_BLOCKS 256
@@ -63,6 +110,33 @@ static struct {
         uint32_t bottom;
     } received_checksums[SDIO_MAX_BLOCKS];
 } g_sdio;
+
+#if !PSRAM_FORCE_BITBANG
+static void sdio_select_data_program(SdioDataProgram wanted)
+{
+    // SM1 must be stopped while its instruction words are replaced. Use the
+    // atomic CTRL alias because core1 can independently start/stop PSRAM SM2.
+    sdio_sm_set_enabled(SDIO_DATA_SM, false);
+    if (sLoadedDataProgram == wanted)
+        return;
+
+    if (sLoadedDataProgram == SdioDataProgram::Rx)
+        pio_remove_program(SDIO_PIO, &sdio_data_rx_program,
+                           SDIO_DATA_PROGRAM_OFFSET);
+    else if (sLoadedDataProgram == SdioDataProgram::Tx)
+        pio_remove_program(SDIO_PIO, &sdio_data_tx_program,
+                           SDIO_DATA_PROGRAM_OFFSET);
+
+    if (wanted == SdioDataProgram::Rx)
+        pio_add_program_at_offset(SDIO_PIO, &sdio_data_rx_program,
+                                  SDIO_DATA_PROGRAM_OFFSET);
+    else if (wanted == SdioDataProgram::Tx)
+        pio_add_program_at_offset(SDIO_PIO, &sdio_data_tx_program,
+                                  SDIO_DATA_PROGRAM_OFFSET);
+
+    sLoadedDataProgram = wanted;
+}
+#endif
 
 void rp2040_sdio_dma_irq();
 
@@ -404,7 +478,11 @@ sdio_status_t rp2040_sdio_rx_start(uint8_t *buffer, uint32_t num_blocks)
     setupRxTransfer(buffer, num_blocks);
 
     // Initialize PIO state machine
-    pio_sm_init(SDIO_PIO, SDIO_DATA_SM, g_sdio.pio_data_rx_offset, &g_sdio.pio_cfg_data_rx);
+#if !PSRAM_FORCE_BITBANG
+    sdio_select_data_program(SdioDataProgram::Rx);
+#endif
+    sdio_sm_init(SDIO_DATA_SM, g_sdio.pio_data_rx_offset,
+                 &g_sdio.pio_cfg_data_rx);
     pio_sm_set_consecutive_pindirs(SDIO_PIO, SDIO_DATA_SM, SDIO_D0, 4, false);
 
     // Write number of nibbles to receive to Y register
@@ -412,7 +490,7 @@ sdio_status_t rp2040_sdio_rx_start(uint8_t *buffer, uint32_t num_blocks)
 
     // Start PIO and DMA
     dma_channel_start(SDIO_DMA_CHB);
-    pio_sm_set_enabled(SDIO_PIO, SDIO_DATA_SM, true);
+    sdio_sm_set_enabled(SDIO_DATA_SM, true);
 
     return SDIO_OK;
 }
@@ -518,7 +596,11 @@ sdio_block_poll_status_t rp2040_sdio_rx_poll_one_block()
 static void sdio_start_next_block_tx()
 {
     // Initialize PIO
-    pio_sm_init(SDIO_PIO, SDIO_DATA_SM, g_sdio.pio_data_tx_offset, &g_sdio.pio_cfg_data_tx);
+#if !PSRAM_FORCE_BITBANG
+    sdio_select_data_program(SdioDataProgram::Tx);
+#endif
+    sdio_sm_init(SDIO_DATA_SM, g_sdio.pio_data_tx_offset,
+                 &g_sdio.pio_cfg_data_tx);
     
     // Configure DMA to send the data block payload (512 bytes)
     dma_channel_config dmacfg = dma_channel_get_default_config(SDIO_DMA_CH);
@@ -560,7 +642,7 @@ static void sdio_start_next_block_tx()
     dma_channel_start(SDIO_DMA_CH);
     
     // Start state machine
-    pio_sm_set_enabled(SDIO_PIO, SDIO_DATA_SM, true);
+    sdio_sm_set_enabled(SDIO_DATA_SM, true);
 }
 
 static void sdio_compute_next_tx_checksum()
@@ -741,7 +823,7 @@ sdio_status_t rp2040_sdio_stop()
     dma_channel_abort(SDIO_DMA_CH);
     dma_channel_abort(SDIO_DMA_CHB);
     dma_set_irq1_channel_mask_enabled(1 << SDIO_DMA_CHB, 0);
-    pio_sm_set_enabled(SDIO_PIO, SDIO_DATA_SM, false);
+    sdio_sm_set_enabled(SDIO_DATA_SM, false);
     pio_sm_set_consecutive_pindirs(SDIO_PIO, SDIO_DATA_SM, SDIO_D0, 4, false);
     g_sdio.transfer_state = SDIO_IDLE;
     return SDIO_OK;
@@ -764,11 +846,14 @@ void rp2040_sdio_init(int clock_divider)
 
     dma_channel_abort(SDIO_DMA_CH);
     dma_channel_abort(SDIO_DMA_CHB);
-    pio_sm_set_enabled(SDIO_PIO, SDIO_CMD_SM, false);
-    pio_sm_set_enabled(SDIO_PIO, SDIO_DATA_SM, false);
+    sdio_sm_set_enabled(SDIO_CMD_SM, false);
+    sdio_sm_set_enabled(SDIO_DATA_SM, false);
 
     // Load PIO programs
     pio_clear_instruction_memory(SDIO_PIO);
+#if !PSRAM_FORCE_BITBANG
+    sLoadedDataProgram = SdioDataProgram::None;
+#endif
 
     // Command & clock state machine
     g_sdio.pio_cmd_clk_offset = pio_add_program(SDIO_PIO, &sdio_cmd_clk_program);
@@ -783,12 +868,25 @@ void rp2040_sdio_init(int clock_divider)
     sm_config_set_clkdiv_int_frac(&cfg, clock_divider, 0);
     sm_config_set_mov_status(&cfg, STATUS_TX_LESSTHAN, 2);
 
-    pio_sm_init(SDIO_PIO, SDIO_CMD_SM, g_sdio.pio_cmd_clk_offset, &cfg);
+    sdio_sm_init(SDIO_CMD_SM, g_sdio.pio_cmd_clk_offset, &cfg);
     pio_sm_set_consecutive_pindirs(SDIO_PIO, SDIO_CMD_SM, SDIO_CLK, 1, true);
-    pio_sm_set_enabled(SDIO_PIO, SDIO_CMD_SM, true);
+    sdio_sm_set_enabled(SDIO_CMD_SM, true);
 
-    // Data reception program
+    // Data programs. In the PIO PSRAM build RX and TX occupy the same fixed
+    // slot and are swapped only while SM1 is disabled. The production
+    // bit-bang build retains the original always-resident layout unchanged.
+#if !PSRAM_FORCE_BITBANG
+    g_sdio.pio_data_rx_offset = SDIO_DATA_PROGRAM_OFFSET;
+    g_sdio.pio_data_tx_offset = SDIO_DATA_PROGRAM_OFFSET;
+    pio_add_program_at_offset(SDIO_PIO, &sdio_data_tx_program,
+                              SDIO_DATA_PROGRAM_OFFSET);
+    sLoadedDataProgram = SdioDataProgram::Tx;
+#else
     g_sdio.pio_data_rx_offset = pio_add_program(SDIO_PIO, &sdio_data_rx_program);
+    g_sdio.pio_data_tx_offset = pio_add_program(SDIO_PIO, &sdio_data_tx_program);
+#endif
+
+    // Data reception configuration
     g_sdio.pio_cfg_data_rx = sdio_data_rx_program_get_default_config(g_sdio.pio_data_rx_offset);
     sm_config_set_in_pins(&g_sdio.pio_cfg_data_rx, SDIO_D0);
     sm_config_set_in_shift(&g_sdio.pio_cfg_data_rx, false, true, 32);
@@ -796,8 +894,7 @@ void rp2040_sdio_init(int clock_divider)
     sm_config_set_clkdiv_int_frac(&g_sdio.pio_cfg_data_rx, clock_divider, 0);
     sm_config_set_sideset_pins(&g_sdio.pio_cfg_data_rx, SDIO_CLK);
 
-    // Data transmission program
-    g_sdio.pio_data_tx_offset = pio_add_program(SDIO_PIO, &sdio_data_tx_program);
+    // Data transmission configuration
     g_sdio.pio_cfg_data_tx = sdio_data_tx_program_get_default_config(g_sdio.pio_data_tx_offset);
     sm_config_set_in_pins(&g_sdio.pio_cfg_data_tx, SDIO_D0);
     sm_config_set_set_pins(&g_sdio.pio_cfg_data_tx, SDIO_D0, 4);

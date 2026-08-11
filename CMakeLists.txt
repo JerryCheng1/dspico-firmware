@@ -15,11 +15,15 @@ add_compile_definitions(DSpico
 option(ENABLE_R4_MODE "Enable R4 emulation" ON)
 option(ENABLE_PSRAM_CACHE "Cache SD sectors (E3/E5 path) in the external APS6404 PSRAM (GPIO22-26/29)" ON)
 option(ENABLE_UART_LOG "Print firmware logs on the debug UART (GPIO0/1)" OFF)
-option(PSRAM_USE_PIO "Use the experimental PIO0 PSRAM data path instead of SIO bit-bang" OFF)
+option(PSRAM_USE_PIO "Use the experimental PIO1 SM2 PSRAM path with dynamic SDIO RX/TX program sharing" OFF)
+option(PSRAM_CACHE_ENABLE_ON_PROBE "Enable E3/E5 cache after PSRAM probe; OFF is a probe-only diagnostic" ON)
 
 add_executable(DSpico
   src/main.cpp
   src/common.h
+  src/pioUtil.h
+  src/uartLog.c
+  src/uartLog.h
   src/romData.S
   src/romData.h
   src/blowfish.c
@@ -76,6 +80,12 @@ if(ENABLE_PSRAM_CACHE)
   target_compile_definitions(DSpico PRIVATE
     ENABLE_PSRAM_CACHE
   )
+endif()
+
+if(PSRAM_CACHE_ENABLE_ON_PROBE)
+  target_compile_definitions(DSpico PRIVATE PSRAM_CACHE_ENABLE_ON_PROBE=1)
+else()
+  target_compile_definitions(DSpico PRIVATE PSRAM_CACHE_ENABLE_ON_PROBE=0)
 endif()
 
 if(PSRAM_USE_PIO)

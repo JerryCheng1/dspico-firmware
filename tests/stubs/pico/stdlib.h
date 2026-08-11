@@ -11,3 +11,11 @@ uint64_t time_us_64(void);
 static inline void __sev(void)
 {
 }
+
+static inline void __wfe(void)
+{
+}
+
+static inline void __dmb(void)
+{
+}

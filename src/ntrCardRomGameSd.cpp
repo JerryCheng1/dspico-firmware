@@ -18,6 +18,13 @@ static bool sNextWriteBlockQueued = false;
 static bool sNextWriteIsLast = false;
 static u32 sNextWriteSector = 0xFFFFFFFF;
 
+extern "C"
+{
+volatile u32 gCartSdE4Polls;
+volatile u32 gCartSdE4Ready;
+volatile u32 gCartSdE5Reads;
+}
+
 #ifdef ENABLE_PSRAM_CACHE
 // The SD sector cache backfills sectors served from the SD card. E3 sets this
 // to the sector it requested on a miss so E5 (which serves the data) knows
@@ -27,17 +34,17 @@ static u32 sNextWriteSector = 0xFFFFFFFF;
 static volatile u32 sPendingStoreSector = 0xFFFFFFFF;
 
 // Async cache-HIT state. On a hit E3 (PIO0_IRQ_0) only does a tag check - it
-// must NOT psram_read there (that blackouts the IRQ). Instead it records the
+// must NOT psram_read there (that keeps the handler busy too long). It records
 // sector here and leaves buffer 0 invalid; ntrc_sdCacheFetchDrain() on the
-// main loop does the bit-bang psram_read into buffer 0 and marks it valid, so
+// main loop does the PSRAM read into buffer 0 and marks it valid, so
 // E4 reports not-ready until the drain completes, then ready.
 static volatile u32 sPendingFetchSector = 0xFFFFFFFF;
 static volatile bool sPendingFetch;
 #endif
 
 // Main-loop drain for an async SD cache hit. Fills buffer 0 from PSRAM and
-// marks it valid so E4 reports ready. Runs on core0 (preemptible by PIO0_IRQ_0,
-// bit-bang takes no lock). Must NOT be called from IRQ context.
+// marks it valid so E4 reports ready. Runs on core0 and remains preemptible by
+// PIO0_IRQ_0 with either backend. Must NOT be called from IRQ context.
 extern "C" void ntrc_sdCacheFetchDrain(void)
 {
 #ifdef ENABLE_PSRAM_CACHE
@@ -45,7 +52,7 @@ extern "C" void ntrc_sdCacheFetchDrain(void)
         return;
 
     u32 sector = sPendingFetchSector;
-    // Fill buffer 0 from the PSRAM cache (bit-bang, ~64 us). A write may have
+    // Fill buffer 0 from the PSRAM cache. A write may have
     // invalidated the line while it was in flight. In that case fall back to
     // the SD card; if a write currently owns the SD interface, retain the
     // pending request and retry from the main loop once it becomes idle.
@@ -70,7 +77,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu
     sReadSector = word;
 #ifdef ENABLE_PSRAM_CACHE
     // Cache hit: the sector is in PSRAM, but we must NOT read it here (a
-    // psram_read in PIO0_IRQ_0 blackouts the IRQ and breaks the loader). Do a
+    // psram_read in PIO0_IRQ_0 keeps the handler busy and breaks the loader).
     // tag-only check; on a hit record the sector for the main-loop drain
     // (ntrc_sdCacheFetchDrain) and leave both buffers invalid so E4 reports
     // not-ready until the drain fills buffer 0. No SD read is started.
@@ -105,6 +112,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu
 
 extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
+    gCartSdE4Polls++;
     ntrc_beginWrite(pio, 4);
 
     bool sdReady;
@@ -135,6 +143,8 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu
     }
 
     ntrc_writeWord(pio, sdReady ? 1 : 0);
+    if (sdReady)
+        gCartSdE4Ready++;
     ntrc_finishGameNoScrambleCmd0(romEmu);
 
     if (sWriteBusy && sdReady && sNextWriteBlockQueued)
@@ -152,6 +162,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu
 
 extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
+    gCartSdE5Reads++;
     ntrc_beginWrite(pio, 512);
 
     // without scrambling to save time
