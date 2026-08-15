@@ -117,3 +117,15 @@ endif()
 
 pico_add_extra_outputs(DSpico)
 target_link_libraries(DSpico pico_stdlib hardware_pio hardware_dma pico_multicore)
+
+# Pico SDK's RP2040 linker script places core stacks at the tops of the two
+# 4 KB scratch banks but does not assert that user scratch sections stay below
+# them. Make overlap a hard link error instead of a low-probability runtime
+# corruption of the cartridge IRQ code.
+set(DSPICO_SCRATCH_ASSERT_SCRIPT
+  ${CMAKE_CURRENT_LIST_DIR}/src/scratch_stack_assert.ld)
+target_link_options(DSpico PRIVATE
+  "-Wl,-T${DSPICO_SCRATCH_ASSERT_SCRIPT}"
+)
+set_property(TARGET DSpico APPEND PROPERTY LINK_DEPENDS
+  ${DSPICO_SCRATCH_ASSERT_SCRIPT})

@@ -105,13 +105,22 @@ extern "C" DRESULT disk_write (
         case DEV_SD:
         {
 #ifdef ENABLE_PSRAM_CACHE
-            // FatFs writes (notably R4 save-file updates) bypass the F6/raw
-            // cartridge write callbacks. Invalidate every physical sector at
-            // this final write-through boundary so E3 cannot serve stale data.
+            // FatFs writes (launcher settings and R4 save-file updates) bypass
+            // the F6/raw cartridge callbacks. Pause the cache and drain any
+            // core1 PSRAM transaction before SDIO sees the write buffer.
+            romCacheSdWriteBegin();
+            while (!romCacheSdWriteBarrierReady())
+                tight_loop_contents();
+
+            // Invalidate every physical sector at this final write-through
+            // boundary so E3 cannot serve stale pre-write data.
             for (UINT i = 0; i < count; i++)
                 romCacheSdInvalidateSector((u32)sector + i);
 #endif
             while (!gSdCard.TryWriteSectorsSync(buff, sector, count));
+#ifdef ENABLE_PSRAM_CACHE
+            romCacheSdWriteEnd();
+#endif
             return RES_OK;
         }
     }

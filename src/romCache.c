@@ -41,12 +41,14 @@ static volatile bool sCacheAvailable;
 // Shared state between core1 (writer) and core0 (reader):
 static volatile bool sProbeDone;        // core1 sets when probe finished
 static volatile bool sProbeOk;          // core1 sets: probe succeeded
+static volatile bool sQualificationDone;// core1 sets at terminal qualification
 static volatile bool sTestFailed;       // core1 sets: a test chunk mismatched
 static volatile u32  sTestFailAddr;     // core1 sets: failing address
 #if PSRAM_FULL_CHIP_TEST
 static volatile u32  sTestAddr;         // progress, for logging
 #endif
 static volatile u32  sTestStart;
+static volatile u32  sTestElapsedMs;
 
 // core0 sets sHwInitDone once psram_init_hw() has configured the PSRAM GPIO,
 // reset the chip, and armed sUsePio. core1 must not probe before this: an
@@ -73,12 +75,14 @@ void romCacheInit(void)
     sCacheAvailable = false;
     sProbeDone = false;
     sProbeOk = false;
+    sQualificationDone = false;
     sTestFailed = false;
     sTestFailAddr = 0;
 #if PSRAM_FULL_CHIP_TEST
     sTestAddr = 0;
 #endif
     sTestStart = 0;
+    sTestElapsedMs = 0;
     sHwInitDone = false;
     // Hardware init + selected backend. Safe during boot (busy_wait, no data
     // bursts). The probe/test is driven by core1 after this returns.
@@ -93,6 +97,12 @@ void romCacheInit(void)
 bool romCacheIsAvailable(void)
 {
     return sCacheAvailable;
+}
+
+bool romCacheQualificationFinished(void)
+{
+    __dmb();
+    return sQualificationDone;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +181,21 @@ static u8 sAsyncStoreBuf[SD_CACHE_LINE_SIZE] __attribute__((aligned(4)));
 static volatile u32 sAsyncStoreSector;
 static volatile u8 sAsyncStoreGeneration;
 static volatile bool sAsyncStorePending;
+// The store-drain state is module-wide rather than function-local because an
+// SD write barrier must distinguish its own asynchronous backfill from a
+// synchronous cache read using the same core1 worker. Only an owned backfill
+// may be completed with psram_core1_async_finish(); consuming a synchronous
+// read's DONE state would leave psramSubmitCore1() waiting forever.
+static volatile bool sAsyncStoreInFlight;
+static u16 sAsyncStoreChecksum;
+static u64 sFirstStoreStartUs;
+static bool sLoggedFirstStore;
+
+// Set before any physical SD write. While active, E3 is forced to miss, E5
+// drops backfills, and a write cannot start until the core1 PSRAM worker is
+// idle. This makes the cache a read-through/write-around cache with a real
+// write transaction boundary rather than tag invalidation alone.
+static volatile bool sSdWriteBarrierActive;
 
 // Fast 16-bit folded FNV-1a digest. This runs only on the core0 main loop,
 // never in PIO0_IRQ_0. It is not cryptographic; it is an integrity guard for
@@ -186,6 +211,11 @@ static u16 sdCacheChecksum(const u8* data)
 void romCacheSdInit(void)
 {
     sAsyncStorePending = false;
+    sAsyncStoreInFlight = false;
+    sAsyncStoreChecksum = 0;
+    sFirstStoreStartUs = 0;
+    sLoggedFirstStore = false;
+    sSdWriteBarrierActive = false;
     for (u32 i = 0; i < SD_CACHE_NUM_LINES; i++)
     {
         sSdTags[i] = 0xFFFFFFFF;
@@ -227,6 +257,17 @@ void romCacheSdInvalidateSector(u32 sector)
 #endif
 }
 
+// Invalidates a direct-mapped line after an abandoned in-flight backfill. The
+// PSRAM data has already been overwritten, so an older tag for the same line
+// must not remain valid even though the new tag was never published.
+static void sdCacheInvalidateLine(u32 lineIdx)
+{
+    if (sSdTags[lineIdx] != 0xFFFFFFFF && sSdUsedLines > 0)
+        sSdUsedLines--;
+    sSdTags[lineIdx] = 0xFFFFFFFF;
+    sSdLineGenerations[lineIdx]++;
+}
+
 bool romCacheSdCheckHit(u32 sector)
 {
 #if !SD_CACHE_ENABLE
@@ -235,7 +276,7 @@ bool romCacheSdCheckHit(u32 sector)
 #else
     // Gate first so the warmup miss path is one SRAM byte load + counter,
     // matching the minimal probe-only path as closely as possible.
-    if (!sCacheIoEnabled || !sCacheAvailable)
+    if (!sCacheIoEnabled || !sCacheAvailable || sSdWriteBarrierActive)
     {
         sSdMisses++;
         return false;
@@ -263,6 +304,9 @@ bool romCacheSdReadCached(u32 sector, u8* dst)
 #if !SD_CACHE_ENABLE
     return false;
 #else
+    if (sSdWriteBarrierActive)
+        return false;
+
     u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
     u8 generation = sSdLineGenerations[lineIdx];
     u16 expectedChecksum = sSdChecksums[lineIdx];
@@ -296,8 +340,11 @@ bool romCacheSdReadCached(u32 sector, u8* dst)
     psram_read(lineIdx * SD_CACHE_LINE_SIZE, dst, SD_CACHE_LINE_SIZE);
     u16 actualChecksum = sdCacheChecksum(dst);
     if (traceFirstFetch)
-        LOG("[cache] first hit fetch done in %" PRIu64 " us\n",
-            time_us_64() - fetchStartUs);
+        LOG("[cache] first hit fetch done in %" PRIu64
+            " us bursts=%" PRIu32 " checksum=%04" PRIX32 "/%04" PRIX32
+            "\n", time_us_64() - fetchStartUs,
+            psram_core1_last_burst_count(), (u32)actualChecksum,
+            (u32)expectedChecksum);
 
     // An SD write may have preempted the bit-bang read and invalidated this
     // line. Validate and return while IRQs are briefly masked so the check is
@@ -306,7 +353,8 @@ bool romCacheSdReadCached(u32 sector, u8* dst)
     bool metadataValid = sSdLineGenerations[lineIdx] == generation &&
                          sSdTags[lineIdx] == sector;
     bool checksumValid = actualChecksum == expectedChecksum;
-    bool stillValid = metadataValid && checksumValid;
+    bool stillValid = !sSdWriteBarrierActive &&
+                      metadataValid && checksumValid;
     if (metadataValid && !checksumValid)
     {
         if (sSdUsedLines > 0)
@@ -333,7 +381,7 @@ void romCacheSdStore(u32 sector, const u8* src)
     // During pico-loader mount/open, make the runtime PSRAM data path exactly
     // as quiet as the proven probe-only firmware. Do not even copy/queue the
     // sector: it can be cached normally if requested again after warmup.
-    if (!sCacheIoEnabled || !sCacheAvailable)
+    if (!sCacheIoEnabled || !sCacheAvailable || sSdWriteBarrierActive)
         return;
 
     // Drop if the previous store is still being drained: overwriting
@@ -358,33 +406,40 @@ void romCacheSdStoreDrain(void)
     if (!sAsyncStorePending)
         return;
 
-    static bool sStoreInFlight;
-    static u64 sFirstStoreStartUs;
-    static bool sLoggedFirstStore;
-    static u16 sStoreChecksum;
-
     u32 sector = sAsyncStoreSector;
     u8 generation = sAsyncStoreGeneration;
     u32 lineIdx = sector & (SD_CACHE_NUM_LINES - 1);
     // Runs on the core0 main loop, NOT in PIO0_IRQ_0. Core0 submits the
     // request to core1 and remains available for the next E3/E4/E5 IRQ while
     // core1 owns the uninterrupted PSRAM transaction.
-    if (!sStoreInFlight)
+    if (!sAsyncStoreInFlight)
     {
-        if (!psram_core1_async_idle())
+        if (sSdWriteBarrierActive || !psram_core1_async_idle())
             return;
         u16 checksum = sdCacheChecksum(sAsyncStoreBuf);
-        if (!psram_core1_async_write(lineIdx * SD_CACHE_LINE_SIZE,
+
+        // A write command may preempt checksum calculation. Reserve the
+        // worker and mark ownership atomically with respect to that IRQ.
+        uint32_t submitIrqState = save_and_disable_interrupts();
+        if (sSdWriteBarrierActive || !sAsyncStorePending ||
+            !psram_core1_async_idle() ||
+            !psram_core1_async_write(lineIdx * SD_CACHE_LINE_SIZE,
                                      sAsyncStoreBuf, SD_CACHE_LINE_SIZE))
+        {
+            restore_interrupts(submitIrqState);
             return;
-        sStoreChecksum = checksum;
-        sStoreInFlight = true;
+        }
+        sAsyncStoreChecksum = checksum;
+        sAsyncStoreInFlight = true;
+        restore_interrupts(submitIrqState);
         if (!sLoggedFirstStore)
         {
             sLoggedFirstStore = true;
             sFirstStoreStartUs = time_us_64();
             LOG("[cache] first async backfill begin sector=%" PRIu32
-                " on core1; core0 continues SDIO\n", sector);
+                " checksum=%04" PRIX32
+                " on core1; core0 continues SDIO\n", sector,
+                (u32)sAsyncStoreChecksum);
         }
     }
 
@@ -393,7 +448,7 @@ void romCacheSdStoreDrain(void)
     // write was in flight.
     if (!psram_core1_async_finish())
         return;
-    sStoreInFlight = false;
+    sAsyncStoreInFlight = false;
     if (sFirstStoreStartUs != 0)
     {
         LOG("[cache] first async backfill done in %" PRIu64 " us\n",
@@ -407,15 +462,82 @@ void romCacheSdStoreDrain(void)
     // handful of SRAM instructions; the slow PSRAM transfer already completed
     // asynchronously on core1.
     uint32_t irqState = save_and_disable_interrupts();
-    if (sSdLineGenerations[lineIdx] == generation)
+    if (!sSdWriteBarrierActive &&
+        sSdLineGenerations[lineIdx] == generation)
     {
         if (sSdTags[lineIdx] == 0xFFFFFFFF)
             sSdUsedLines++;
-        sSdChecksums[lineIdx] = sStoreChecksum;
+        sSdChecksums[lineIdx] = sAsyncStoreChecksum;
         sSdTags[lineIdx] = sector;
+    }
+    else if (sSdWriteBarrierActive)
+    {
+        // The backfill overwrote this PSRAM line after the write transaction
+        // started, but its tag must never become visible. Also discard any old
+        // tag whose data occupied the same direct-mapped line.
+        sdCacheInvalidateLine(lineIdx);
     }
     sAsyncStorePending = false; // release only after write/publication finishes
     restore_interrupts(irqState);
+#endif
+}
+
+void romCacheSdWriteBegin(void)
+{
+#if !SD_CACHE_ENABLE && !SD_CACHE_STORE
+    return;
+#else
+    uint32_t irqState = save_and_disable_interrupts();
+    sSdWriteBarrierActive = true;
+    __dmb();
+    // A queued store has not touched PSRAM and can be dropped immediately.
+    // An in-flight store retains its source buffer and is drained/discarded by
+    // romCacheSdWriteBarrierReady().
+    if (sAsyncStorePending && !sAsyncStoreInFlight)
+        sAsyncStorePending = false;
+    restore_interrupts(irqState);
+#endif
+}
+
+bool romCacheSdWriteBarrierReady(void)
+{
+#if !SD_CACHE_ENABLE && !SD_CACHE_STORE
+    return true;
+#else
+    if (!sSdWriteBarrierActive)
+        return true;
+
+    if (sAsyncStoreInFlight)
+    {
+        // This completion belongs to our asynchronous backfill, so it is safe
+        // to consume. Do not use async_finish() for an unowned synchronous
+        // read: its waiting psramSubmitCore1() must release that request.
+        if (!psram_core1_async_finish())
+            return false;
+
+        u32 lineIdx = sAsyncStoreSector & (SD_CACHE_NUM_LINES - 1);
+        uint32_t irqState = save_and_disable_interrupts();
+        sdCacheInvalidateLine(lineIdx);
+        sAsyncStoreInFlight = false;
+        sAsyncStorePending = false;
+        sFirstStoreStartUs = 0;
+        restore_interrupts(irqState);
+    }
+
+    // If this is false with no owned async store, a synchronous cache fetch
+    // was preempted by the write command. Leave DONE untouched; after its main
+    // loop waiter resumes it will set the worker to IDLE and this becomes true.
+    return !sAsyncStoreInFlight && psram_core1_async_idle();
+#endif
+}
+
+void romCacheSdWriteEnd(void)
+{
+#if !SD_CACHE_ENABLE && !SD_CACHE_STORE
+    return;
+#else
+    __dmb();
+    sSdWriteBarrierActive = false;
 #endif
 }
 
@@ -425,15 +547,11 @@ void romCacheSdStoreDrain(void)
 // core1 can decide to yield). All bursts here run on core1. The PIO transaction
 // lock never changes either core's PRIMASK, so core0's cart IRQ keeps firing.
 //
-// The probe runs as soon as sHwInitDone goes true (romCacheInit does the
-// __sev that wakes core1). It touches only the PSRAM pins (GPIO22-26/29), which
-// do not overlap the cartridge bus (GPIO9-21); the USB SIO gpio_out
-// race that previously corrupted the bus during the probe is gone (USB
-// removed from the board/build), so no boot delay is needed. (An earlier
-// 3 s delay was for a since-refuted "probe corrupts NDS boot" hypothesis and
-// had the side effect of gating the probe on cart-bus interrupts, since the
-// core0 main loop is __wfi-driven and could not nudge core1 during a quiet
-// loader menu - the probe only ran after the user navigated the menu.)
+// The probe runs as soon as sHwInitDone goes true (romCacheInit does the SEV
+// that wakes core1). In the production bit-bang build, main calls romCacheInit
+// and waits for qualification before enabling cartridge PIO0: no startup PSRAM
+// burst can then overlap NDSL's mount handshake. The experimental PIO1 backend
+// still initializes after SDIO has established its final instruction layout.
 static bool sC1Probed;
 #if PSRAM_FULL_CHIP_TEST
 static bool sC1TestWritePhase;
@@ -452,9 +570,9 @@ bool romCacheCore1Poll(void)
 
     if (!sC1Probed)
     {
-        // Probe immediately: the PSRAM pins do not overlap the cartridge bus
-        // and the USB gpio_out race is gone, so there is no boot window to
-        // avoid. romCacheInit()'s __sev woke us; run the probe now.
+        // romCacheInit() has configured the selected backend and explicitly
+        // released core1. Production main waits for this call to finish before
+        // cartridge PIO0 becomes active.
         sC1Probed = true;
         sTestStart = millis();
         sProbeOk = psram_probe();
@@ -479,6 +597,20 @@ bool romCacheCore1Poll(void)
             // bursts themselves (or core1's activity), not cache use.
 #endif
         }
+#if !PSRAM_FULL_CHIP_TEST
+        sTestElapsedMs = millis() - sTestStart;
+        __dmb();
+        sQualificationDone = true;
+        __sev();
+#else
+        else
+        {
+            sTestElapsedMs = millis() - sTestStart;
+            __dmb();
+            sQualificationDone = true;
+            __sev();
+        }
+#endif
         return true;
     }
     if (!sProbeOk)
@@ -501,6 +633,10 @@ bool romCacheCore1Poll(void)
             {
                 sTestFailAddr = sTestAddr + i;
                 sTestFailed = true;
+                sTestElapsedMs = millis() - sTestStart;
+                __dmb();
+                sQualificationDone = true;
+                __sev();
                 return true;
             }
         }
@@ -518,6 +654,10 @@ bool romCacheCore1Poll(void)
     }
     // verify pass complete
     sCacheAvailable = true;
+    sTestElapsedMs = millis() - sTestStart;
+    __dmb();
+    sQualificationDone = true;
+    __sev();
     return true;
 #else
     return false; // cache enabled on probe success; nothing more to do
@@ -571,7 +711,6 @@ void romCacheUpdate(void)
     // filling the whole 8 MB PSRAM. ACTIVE under pico-loader (its hits/misses
     // grow as it re-reads FAT/dir/font/etc.).
     extern volatile u32 sSdHits, sSdMisses;
-    extern volatile u32 gCartSdE4Polls, gCartSdE4Ready, gCartSdE5Reads;
     static u64 sBeatLastUs;
     static bool sLoggedIoEnable;
     u64 beatNow = time_us_64();
@@ -581,38 +720,6 @@ void romCacheUpdate(void)
         sLoggedIoEnable = true;
         LOG("[cache] read/backfill paths enabled after %" PRIu32
             " ms mount/open quiet window\n", (u32)SD_CACHE_IO_WARMUP_MS);
-    }
-
-    // One early snapshot confirms whether pico-loader reached its first E3
-    // request even if it fails before the normal three-second heartbeat.
-    static bool sLoggedFirstSdRequest;
-    if (!sLoggedFirstSdRequest && sSdHits + sSdMisses != 0)
-    {
-        sLoggedFirstSdRequest = true;
-        LOG("[cache] first E3: hit=%" PRIu32 " miss=%" PRIu32
-            " used=%" PRIu32 "/%" PRIu32 " E4=%" PRIu32
-            "/%" PRIu32 " E5=%" PRIu32 "\n",
-            (u32)sSdHits, (u32)sSdMisses, (u32)sSdUsedLines,
-            (u32)SD_CACHE_NUM_LINES, (u32)gCartSdE4Ready,
-            (u32)gCartSdE4Polls, (u32)gCartSdE5Reads);
-    }
-
-    // E4 is the loader's ready poll and E5 consumes the sector. Report early
-    // progress at most every 100 ms; a stream of E4-not-ready with no E5
-    // distinguishes physical SDIO completion failure from cache corruption.
-    static u64 sLastCartSdDiagUs;
-    static u32 sLastCartSdE4Polls;
-    static u32 sLastCartSdE5Reads;
-    if ((gCartSdE4Polls != sLastCartSdE4Polls ||
-         gCartSdE5Reads != sLastCartSdE5Reads) &&
-        beatNow - sLastCartSdDiagUs >= 100000)
-    {
-        sLastCartSdDiagUs = beatNow;
-        sLastCartSdE4Polls = gCartSdE4Polls;
-        sLastCartSdE5Reads = gCartSdE5Reads;
-        LOG("[cart-sd] E4 ready/poll=%" PRIu32 "/%" PRIu32
-            " E5=%" PRIu32 "\n", (u32)gCartSdE4Ready,
-            (u32)gCartSdE4Polls, (u32)gCartSdE5Reads);
     }
 
     if (beatNow - sBeatLastUs >= 3000000)
@@ -626,11 +733,12 @@ void romCacheUpdate(void)
         u32 capKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024; // 8 MB
         u32 usedKb = (usedLines * SD_CACHE_LINE_SIZE) / 1024;
         u32 freeKb = capKb - usedKb;
-        LOG("[cache] SD hit=%" PRIu32 " miss=%" PRIu32
-            " rate=%" PRIu32 ".%" PRIu32 "%% verifyfail=%" PRIu32
-            " | used=%" PRIu32 "/%" PRIu32
+        // Keep UART diagnostics ASCII-only. Many serial terminals default to
+        // a legacy Windows code page and render UTF-8 Chinese as mojibake.
+        LOG("[cache] SD hit-rate=%" PRIu32 ".%" PRIu32
+            "%% verifyfail=%" PRIu32 " | used=%" PRIu32 "/%" PRIu32
             " lines (%" PRIu32 "KB) free=%" PRIu32 "KB/%" PRIu32 "KB\n",
-            (u32)sSdHits, (u32)sSdMisses, sdRate / 10, sdRate % 10,
+            sdRate / 10, sdRate % 10,
             (u32)sSdVerifyFailures, usedLines, (u32)SD_CACHE_NUM_LINES,
             usedKb, freeKb, capKb);
     }
@@ -661,7 +769,7 @@ void romCacheUpdate(void)
             // heartbeat. The SD cache is the only layer; it fills the PSRAM.
             u32 sdCapKb = (SD_CACHE_NUM_LINES * SD_CACHE_LINE_SIZE) / 1024;
             LOG("PSRAM: probe OK (%lu ms), %" PRIu32 " KB chip\n",
-                (unsigned long)(millis() - sTestStart),
+                (unsigned long)sTestElapsedMs,
                 (u32)(PSRAM_SIZE_BYTES / 1024));
             LOG("PSRAM: SD cache enabled - %" PRIu32 " lines x %" PRIu32
                 "B = %" PRIu32 "KB (E3/E5 sector cache, fills chip)\n",
@@ -685,4 +793,3 @@ void romCacheUpdate(void)
 }
 
 #endif
-

@@ -1,5 +1,6 @@
 #include "common.h"
 #include <stdio.h>
+#include "hardware/sync.h"
 #include "r4.h"
 #include "ntrCardRom.h"
 #include "ntrCardRomGameNoScramble.h"
@@ -7,16 +8,34 @@
 #include "romCache.h"
 #endif
 
-static u8 sSdSectorBuf[1024];
+// Physical SD reads and cartridge writes must never share storage. A cache-hit
+// fetch runs synchronously on the core0 main loop but remains IRQ-preemptible;
+// F6/R4 can therefore receive a write payload while that fetch is still using
+// the read buffer. Keeping a dedicated double-buffer prevents the resumed
+// PSRAM read from overwriting bytes that are about to be committed to SD.
+static u8 sSdSectorBuf[1024] __attribute__((aligned(4)));
+static u8 sSdWriteSectorBuf[1024] __attribute__((aligned(4)));
 static u32 sCurSdSector = 0xFFFFFFFF;
 static u32 sSdSectorBuffersSectors[2] = { 0xFFFFFFFF, 0xFFFFFFFF };
 static u32 sBufferIndex = 0;
+static u32 sWriteBufferIndex = 0;
 static u32 sReadSector;
 static bool sReadBusy = false;
+// Own the LBA and destination buffer captured when a physical SDIO read is
+// submitted. sReadSector/sBufferIndex describe the cartridge protocol and can
+// advance in an IRQ while SDIO is still active; using either of those mutable
+// values to label a completed DMA can publish sector A under sector B's tag.
+static u32 sPhysicalReadSector = 0xFFFFFFFF;
+static u32 sPhysicalReadBufferIndex = 0;
 static bool sWriteBusy = false;
+static bool sWritePendingStart = false;
+static bool sCurrentWriteIsLast = false;
+static u32 sCurrentWriteSector = 0xFFFFFFFF;
+static u32 sCurrentWriteBufferIndex = 0;
 static bool sNextWriteBlockQueued = false;
 static bool sNextWriteIsLast = false;
 static u32 sNextWriteSector = 0xFFFFFFFF;
+static u32 sNextWriteBufferIndex = 0;
 
 extern "C"
 {
@@ -42,6 +61,56 @@ static volatile u32 sPendingFetchSector = 0xFFFFFFFF;
 static volatile bool sPendingFetch;
 #endif
 
+static bool __time_critical_func(beginPhysicalSdRead)(u32 bufferIndex,
+                                                      u32 sector)
+{
+    // The request and its ownership record form one publication. A cartridge
+    // write IRQ must not cancel the SdCard request in the few instructions
+    // before sReadBusy/LBA/buffer become visible.
+    uint32_t irqState = save_and_disable_interrupts();
+    bool accepted = gSdCard.TryBeginReadSectors(
+        &sSdSectorBuf[bufferIndex * 512], sector, 1);
+    if (!accepted)
+    {
+        restore_interrupts(irqState);
+        return false;
+    }
+
+    sPhysicalReadSector = sector;
+    sPhysicalReadBufferIndex = bufferIndex;
+    sReadBusy = true;
+    restore_interrupts(irqState);
+    return true;
+}
+
+static void __time_critical_func(cancelPhysicalSdRead)(void)
+{
+    if (sReadBusy)
+        gSdCard.Cancel();
+    sReadBusy = false;
+    sPhysicalReadSector = 0xFFFFFFFF;
+    sPhysicalReadBufferIndex = 0;
+}
+
+// This translation unit used to live in SCRATCH_Y together with the core0
+// stack. The cache/write state machines grew large enough to overlap that
+// stack, corrupting the cartridge handlers before NDSL reached its first E3.
+// Keep these routines deterministic and out of XIP, but place them in the
+// larger striped SRAM region via __time_critical_func instead.
+static void __time_critical_func(beginSdWriteTransaction)(void)
+{
+    // Stop publishing any read that was requested before this write. The
+    // physical read buffer is separate from the write payload, but the SDIO
+    // state machine still has to become idle before the write can start.
+#ifdef ENABLE_PSRAM_CACHE
+    sPendingFetch = false;
+    sPendingFetchSector = 0xFFFFFFFF;
+    sPendingStoreSector = 0xFFFFFFFF;
+    romCacheSdWriteBegin();
+#endif
+    cancelPhysicalSdRead();
+}
+
 // Main-loop drain for an async SD cache hit. Fills buffer 0 from PSRAM and
 // marks it valid so E4 reports ready. Runs on core0 and remains preemptible by
 // PIO0_IRQ_0 with either backend. Must NOT be called from IRQ context.
@@ -51,26 +120,54 @@ extern "C" void ntrc_sdCacheFetchDrain(void)
     if (!sPendingFetch)
         return;
 
+    // A cache request may have replaced a speculative physical read. Wait for
+    // SdCard::Cancel() to finish before PSRAM writes the same double-buffer.
+    if (!gSdCard.IsReady())
+        return;
+
     u32 sector = sPendingFetchSector;
     // Fill buffer 0 from the PSRAM cache. A write may have
     // invalidated the line while it was in flight. In that case fall back to
     // the SD card; if a write currently owns the SD interface, retain the
     // pending request and retry from the main loop once it becomes idle.
-    if (romCacheSdReadCached(sector, &sSdSectorBuf[0]))
+    bool cacheRead = romCacheSdReadCached(sector, &sSdSectorBuf[0]);
+    if (cacheRead)
     {
-        sSdSectorBuffersSectors[0] = sector;
-        sPendingFetch = false;
+        // F6/R4 may have cancelled this fetch while psram_read was waiting on
+        // core1. Publish only if the exact request is still current.
+        uint32_t irqState = save_and_disable_interrupts();
+        if (sPendingFetch && sPendingFetchSector == sector)
+        {
+            sSdSectorBuffersSectors[0] = sector;
+            sPendingFetch = false;
+            sPendingFetchSector = 0xFFFFFFFF;
+        }
+        restore_interrupts(irqState);
+        return;
     }
-    else if (gSdCard.TryBeginReadSectors(&sSdSectorBuf[0], sector, 1))
+
+    if (!sPendingFetch || sPendingFetchSector != sector)
+        return;
+
+    if (beginPhysicalSdRead(0, sector))
     {
-        sReadBusy = true;
-        sPendingStoreSector = sector;
-        sPendingFetch = false;
+        bool cancelled;
+        uint32_t irqState = save_and_disable_interrupts();
+        cancelled = !sPendingFetch || sPendingFetchSector != sector;
+        if (!cancelled)
+        {
+            sPendingStoreSector = sector;
+            sPendingFetch = false;
+            sPendingFetchSector = 0xFFFFFFFF;
+        }
+        restore_interrupts(irqState);
+        if (cancelled)
+            gSdCard.Cancel();
     }
 #endif
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameReqSdReadCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_noPayload(pio);
     sCurSdSector = 0xFFFFFFFF;
@@ -83,10 +180,14 @@ extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu
     // not-ready until the drain fills buffer 0. No SD read is started.
     if (romCacheSdCheckHit(word))
     {
+        // Normally pico-loader's final E4 has already completed the
+        // speculative next-sector read. Still cancel it explicitly if another
+        // caller starts a new E3 early; otherwise its DMA can overwrite the
+        // PSRAM hit buffer after the cache checksum has passed.
+        cancelPhysicalSdRead();
         sSdSectorBuffersSectors[0] = 0xFFFFFFFF;
         sSdSectorBuffersSectors[1] = 0xFFFFFFFF;
         sBufferIndex = 0;
-        sReadBusy = false;
         sPendingStoreSector = 0xFFFFFFFF; // hit: already cached, no backfill
         sPendingFetchSector = word;
         sPendingFetch = true;
@@ -101,45 +202,67 @@ extern "C" void __scratch_y("cpu0") ntrc_gameReqSdReadCmd1(ntr_rom_emu_t* romEmu
         sSdSectorBuffersSectors[0] = 0xFFFFFFFF;
         sSdSectorBuffersSectors[1] = 0xFFFFFFFF;
         sBufferIndex = 0;
-        if (!gSdCard.TryBeginReadSectors(&sSdSectorBuf[0], sReadSector, 1))
+        if (!beginPhysicalSdRead(0, sReadSector))
         {
             __breakpoint();
         }
-        sReadBusy = true;
     }
     ntrc_finishGameNoScrambleCmd1(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     gCartSdE4Polls++;
     ntrc_beginWrite(pio, 4);
 
     bool sdReady;
+    bool startCurrentWrite = false;
+    bool startNextWrite = false;
+    bool endWriteTransaction = false;
     if (sWriteBusy)
     {
-        sdReady = gSdCard.IsReady();
-        if (sdReady && !sNextWriteBlockQueued)
+        if (sWritePendingStart)
         {
-            sWriteBusy = false;
+            // Do not expose ready until the physical write has completed. The
+            // first poll that sees both SDIO and PSRAM idle starts it after the
+            // E4 response, then a later poll reports completion.
+            sdReady = false;
+#ifdef ENABLE_PSRAM_CACHE
+            startCurrentWrite = gSdCard.IsReady() &&
+                                romCacheSdWriteBarrierReady();
+#else
+            startCurrentWrite = gSdCard.IsReady();
+#endif
+        }
+        else
+        {
+            sdReady = gSdCard.IsReady();
+            if (sdReady)
+            {
+                if (sNextWriteBlockQueued)
+                    startNextWrite = true;
+                else
+                {
+                    sWriteBusy = false;
+                    endWriteTransaction = true;
+                }
+            }
         }
     }
     else
     {
-        if (sSdSectorBuffersSectors[sBufferIndex] == sReadSector)
+        // Retire the exact physical transaction that completed. Never infer
+        // its LBA or destination from the protocol cursor: both can be changed
+        // by E3/E5 IRQs independently of the SDIO DMA.
+        if (sReadBusy && gSdCard.IsReady())
         {
-            sdReady = true;
-        }
-        else if (sReadBusy && gSdCard.IsReady())
-        {
-            sSdSectorBuffersSectors[sBufferIndex] = sReadSector;
-            sdReady = true;
+            sSdSectorBuffersSectors[sPhysicalReadBufferIndex] =
+                sPhysicalReadSector;
             sReadBusy = false;
+            sPhysicalReadSector = 0xFFFFFFFF;
+            sPhysicalReadBufferIndex = 0;
         }
-        else
-        {
-            sdReady = false;
-        }
+        sdReady = sSdSectorBuffersSectors[sBufferIndex] == sReadSector;
     }
 
     ntrc_writeWord(pio, sdReady ? 1 : 0);
@@ -147,9 +270,21 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu
         gCartSdE4Ready++;
     ntrc_finishGameNoScrambleCmd0(romEmu);
 
-    if (sWriteBusy && sdReady && sNextWriteBlockQueued)
+    if (startCurrentWrite)
     {
-        if (!gSdCard.TryBeginWriteSectors(&sSdSectorBuf[sBufferIndex * 512], sNextWriteSector, 1, !sNextWriteIsLast))
+        if (!gSdCard.TryBeginWriteSectors(
+                &sSdWriteSectorBuf[sCurrentWriteBufferIndex * 512],
+                sCurrentWriteSector, 1, !sCurrentWriteIsLast))
+        {
+            __breakpoint();
+        }
+        sWritePendingStart = false;
+    }
+    else if (startNextWrite)
+    {
+        if (!gSdCard.TryBeginWriteSectors(
+                &sSdWriteSectorBuf[sNextWriteBufferIndex * 512],
+                sNextWriteSector, 1, !sNextWriteIsLast))
         {
             __breakpoint();
         }
@@ -158,9 +293,15 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdStatCmd0(ntr_rom_emu_t* romEmu
         sNextWriteIsLast = false;
         sNextWriteSector = 0xFFFFFFFF;
     }
+#ifdef ENABLE_PSRAM_CACHE
+    else if (endWriteTransaction)
+    {
+        romCacheSdWriteEnd();
+    }
+#endif
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameGetSdDataCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     gCartSdE5Reads++;
     ntrc_beginWrite(pio, 512);
@@ -191,23 +332,22 @@ extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd0(ntr_rom_emu_t* romEmu
 
     if (!sReadBusy)
     {
-        if (!gSdCard.TryBeginReadSectors(&sSdSectorBuf[sBufferIndex * 512], sReadSector, 1))
+        if (!beginPhysicalSdRead(sBufferIndex, sReadSector))
         {
             __breakpoint();
         }
-        sReadBusy = true;
     }
 
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameGetSdDataCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameGetSdDataCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     // we still need to advance the state
     ntrc_finishGameNoScrambleCmd1(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameWriteSdDataCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameWriteSdDataCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     if ((word & ~WRITE_SD_DATA_FLAGS_MASK) != NTR_CMD_ID_GAME_WRITE_SD_DATA)
     {
@@ -219,11 +359,13 @@ extern "C" void __scratch_y("cpu0") ntrc_gameWriteSdDataCmd0(ntr_rom_emu_t* romE
     sCurSdSector = 0xFFFFFFFF;
     sSdSectorBuffersSectors[0] = 0xFFFFFFFF;
     sSdSectorBuffersSectors[1] = 0xFFFFFFFF;
+    if ((word & WRITE_SD_DATA_IS_FIRST_FLAG) != 0)
+        beginSdWriteTransaction();
 
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-static void __scratch_y("cpu0") sdWritePayloadComplete(ntr_rom_emu_t* romEmu)
+static void __time_critical_func(sdWritePayloadComplete)(ntr_rom_emu_t* romEmu)
 {
     bool isFirst = (romEmu->cmd0 & WRITE_SD_DATA_IS_FIRST_FLAG) != 0;
     bool isLast = (romEmu->cmd0 & WRITE_SD_DATA_IS_LAST_FLAG) != 0;
@@ -236,21 +378,22 @@ static void __scratch_y("cpu0") sdWritePayloadComplete(ntr_rom_emu_t* romEmu)
 #endif
     if (isFirst)
     {
-        if (!gSdCard.TryBeginWriteSectors(sSdSectorBuf, romEmu->cmd1, 1, !isLast))
-        {
-            __breakpoint();
-        }
         sWriteBusy = true;
+        sWritePendingStart = true;
+        sCurrentWriteIsLast = isLast;
+        sCurrentWriteSector = romEmu->cmd1;
+        sCurrentWriteBufferIndex = sWriteBufferIndex;
     }
     else
     {
         sNextWriteBlockQueued = true;
         sNextWriteIsLast = isLast;
         sNextWriteSector = romEmu->cmd1;
+        sNextWriteBufferIndex = sWriteBufferIndex;
     }
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameWriteSdDataCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameWriteSdDataCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     if ((romEmu->cmd0 & ~WRITE_SD_DATA_FLAGS_MASK) != NTR_CMD_ID_GAME_WRITE_SD_DATA)
     {
@@ -264,20 +407,28 @@ extern "C" void __scratch_y("cpu0") ntrc_gameWriteSdDataCmd1(ntr_rom_emu_t* romE
         sNextWriteBlockQueued = false;
         sNextWriteIsLast = false;
         sNextWriteSector = 0xFFFFFFFF;
-        sBufferIndex = 0;
+        sWritePendingStart = false;
+        sCurrentWriteIsLast = false;
+        sCurrentWriteSector = 0xFFFFFFFF;
+        sWriteBufferIndex = 0;
     }
     else
     {
-        sBufferIndex = 1 - sBufferIndex;
+        sWriteBufferIndex = 1 - sWriteBufferIndex;
     }
 
     ntrc_finishGameNoScrambleCmd1WithReadPayload(romEmu,
-        (u32*)&sSdSectorBuf[sBufferIndex * 512], 512, sdWritePayloadComplete);
+        (u32*)&sSdWriteSectorBuf[sWriteBufferIndex * 512], 512,
+        sdWritePayloadComplete);
 }
 
 #ifdef ENABLE_R4_MODE
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdReadCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+static bool sR4WritePendingStart;
+static bool sR4WriteInProgress;
+static u32 sR4WriteSector = 0xFFFFFFFF;
+
+extern "C" void __time_critical_func(ntrc_gameR4StartSdReadCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     u32 sector = (romEmu->cmd0 << 8) >> 9;
@@ -303,14 +454,14 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdReadCmd0(ntr_rom_emu_t* ro
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSdDataCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetSdDataCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 512);
     ntrc_dmaToBus(sSdSectorBuf, 512);
     romEmu->wordIdx = 0;
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdWriteCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartSdWriteCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginRead(pio, 512);
     sCurSdSector = 0xFFFFFFFF;
@@ -319,10 +470,14 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdWriteCmd0(ntr_rom_emu_t* r
     sNextWriteBlockQueued = false;
     sNextWriteIsLast = false;
     sNextWriteSector = 0xFFFFFFFF;
+    sR4WritePendingStart = false;
+    sR4WriteInProgress = false;
+    sR4WriteSector = 0xFFFFFFFF;
+    beginSdWriteTransaction();
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-static void __scratch_y("cpu0") r4SdWritePayloadComplete(ntr_rom_emu_t* romEmu)
+static void __time_critical_func(r4SdWritePayloadComplete)(ntr_rom_emu_t* romEmu)
 {
     u32 sector = (romEmu->cmd0 << 8) >> 9;
 #ifdef ENABLE_PSRAM_CACHE
@@ -330,25 +485,59 @@ static void __scratch_y("cpu0") r4SdWritePayloadComplete(ntr_rom_emu_t* romEmu)
     // like the F6 write path, including any async backfill already in flight.
     romCacheSdInvalidateSector(sector);
 #endif
-    if (__builtin_expect(!gSdCard.TryBeginWriteSectors(sSdSectorBuf, sector, 1, false), false))
-    {
-        __breakpoint();
-    }
+    sR4WriteSector = sector;
+    sR4WritePendingStart = true;
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSdWriteCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartSdWriteCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-    ntrc_finishGameNoScrambleCmd1WithReadPayload(romEmu, (u32*)sSdSectorBuf, 512, r4SdWritePayloadComplete);
+    ntrc_finishGameNoScrambleCmd1WithReadPayload(
+        romEmu, (u32*)sSdWriteSectorBuf, 512, r4SdWritePayloadComplete);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSdWriteStatCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetSdWriteStatCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     u32 sdStat = 1;
-    if (gSdCard.IsReady())
+    bool startWrite = false;
+    bool endWriteTransaction = false;
+    if (sR4WritePendingStart)
+    {
+#ifdef ENABLE_PSRAM_CACHE
+        startWrite = gSdCard.IsReady() && romCacheSdWriteBarrierReady();
+#else
+        startWrite = gSdCard.IsReady();
+#endif
+    }
+    else if (sR4WriteInProgress && gSdCard.IsReady())
+    {
+        sR4WriteInProgress = false;
         sdStat = 0;
+        endWriteTransaction = true;
+    }
+    else if (!sR4WriteInProgress && gSdCard.IsReady())
+    {
+        sdStat = 0;
+    }
     ntrc_writeWord(pio, sdStat);
     ntrc_finishGameNoScrambleCmd0(romEmu);
+
+    if (startWrite)
+    {
+        if (__builtin_expect(!gSdCard.TryBeginWriteSectors(
+                sSdWriteSectorBuf, sR4WriteSector, 1, false), false))
+        {
+            __breakpoint();
+        }
+        sR4WritePendingStart = false;
+        sR4WriteInProgress = true;
+    }
+#ifdef ENABLE_PSRAM_CACHE
+    else if (endWriteTransaction)
+    {
+        romCacheSdWriteEnd();
+    }
+#endif
 }
 
 #endif

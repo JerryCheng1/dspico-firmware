@@ -101,6 +101,7 @@ static volatile bool sCore1ServiceReady;
 static u32 sCore1Addr;
 static u32 sCore1Len;
 static void* sCore1Buf;
+static volatile u32 sCore1BurstCount;
 
 static inline void psramCeLow(void)
 {
@@ -489,6 +490,7 @@ static void psramSubmitCore1(u32 request, u32 addr, void* buf, u32 len)
     sCore1Addr = addr;
     sCore1Buf = buf;
     sCore1Len = len;
+    sCore1BurstCount = 0;
     __dmb();
     sCore1Request = request;
     __sev();
@@ -508,6 +510,7 @@ bool psram_core1_async_write(u32 addr, const void* buf, u32 len)
     sCore1Addr = addr;
     sCore1Buf = (void*)buf;
     sCore1Len = len;
+    sCore1BurstCount = 0;
     __dmb();
     sCore1Request = PSRAM_C1_WRITE;
     __sev();
@@ -526,6 +529,11 @@ bool psram_core1_async_finish(void)
 bool psram_core1_async_idle(void)
 {
     return sCore1Request == PSRAM_C1_IDLE;
+}
+
+u32 psram_core1_last_burst_count(void)
+{
+    return sCore1BurstCount;
 }
 
 void psram_read(u32 addr, void* buf, u32 len)
@@ -589,6 +597,7 @@ bool psram_core1_service(void)
     sCore1Addr += chunk;
     sCore1Buf = (u8*)sCore1Buf + chunk;
     sCore1Len -= chunk;
+    sCore1BurstCount++;
 
     if (sCore1Len != 0)
         return true;

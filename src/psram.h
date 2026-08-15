@@ -27,9 +27,10 @@ extern "C" {
 // Capacity of the fitted PSRAM: APS6404L-3SQR-ZR = 64 Mbit = 8 MB.
 #define PSRAM_SIZE_BYTES    (8 * 1024 * 1024)
 
-/// @brief Hardware init only (GPIO and reset). No bursts/probe.
-///        Call after physical SD initialization. Falls back to bit-bang if
-///        the reserved PIO1 SM2/instruction region is unavailable.
+/// @brief Hardware init only (GPIO and reset). No bursts/probe. Bit-bang is
+///        independent and may initialize before cartridge/SDIO. The PIO1
+///        backend must initialize after physical SD setup establishes its
+///        final SM/instruction layout, and falls back if SM2 is unavailable.
 void psram_init_hw(void);
 
 /// @brief Probes PSRAM through the selected backend. Run on core1.
@@ -56,6 +57,10 @@ bool psram_core1_async_finish(void);
 
 /// @brief Returns whether no asynchronous/synchronous core1 request is active.
 bool psram_core1_async_idle(void);
+
+/// @brief Number of electrical bursts completed by the most recently
+///        submitted core1 request. Intended for first-transfer diagnostics.
+u32 psram_core1_last_burst_count(void);
 
 /// @brief Core1 worker for all queued runtime transfers, including bit-bang.
 ///        Each call performs at most one bus burst so game-mode callers can

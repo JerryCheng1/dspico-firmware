@@ -63,6 +63,11 @@ bool psram_core1_async_idle(void)
     return !sAsyncPsramPending;
 }
 
+u32 psram_core1_last_burst_count(void)
+{
+    return SD_CACHE_LINE_SIZE / 32;
+}
+
 static void require(bool condition, const char* message)
 {
     if (!condition)
@@ -144,6 +149,8 @@ int main(void)
     romCacheInit();
     romCacheSdInit();
     require(romCacheCore1Poll(), "PSRAM probe did not run");
+    require(romCacheQualificationFinished(),
+            "qualification did not reach a terminal result after probe");
     require(romCacheIsAvailable(), "cache not enabled after successful probe");
 
     // Startup must be genuinely PSRAM-quiet: sectors offered during the
@@ -199,6 +206,63 @@ int main(void)
             "corrupt PSRAM data was incorrectly accepted");
     require(!romCacheSdCheckHit(40),
             "corrupt PSRAM line was not invalidated");
+
+    // A write transaction blocks hits immediately but preserves unrelated
+    // valid cache lines. They become visible again only after write end.
+    fillAndDrain(50, 0x50);
+    require(romCacheSdCheckHit(50), "write-barrier test line was not cached");
+    romCacheSdWriteBegin();
+    require(!romCacheSdCheckHit(50),
+            "cache hit remained visible during an SD write transaction");
+    require(romCacheSdWriteBarrierReady(),
+            "idle write barrier did not become ready");
+    romCacheSdWriteEnd();
+    require(romCacheSdCheckHit(50),
+            "unrelated cache line was lost after an idle write barrier");
+
+    // A queued backfill that has not reached core1 is cancelled outright.
+    memset(queued, 0x51, sizeof(queued));
+    romCacheSdStore(51, queued);
+    romCacheSdWriteBegin();
+    romCacheSdStoreDrain();
+    require(romCacheSdWriteBarrierReady(),
+            "barrier retained a queued, unstarted backfill");
+    romCacheSdWriteEnd();
+    require(!romCacheSdCheckHit(51),
+            "cancelled pre-submit backfill published a cache tag");
+
+    // If core1 already started overwriting a direct-mapped line, the barrier
+    // waits for it, discards the unpublished store, and invalidates the old tag
+    // whose PSRAM bytes were overwritten.
+    const u32 oldSector = 60;
+    const u32 collidingSector = oldSector + SD_CACHE_NUM_LINES;
+    fillAndDrain(oldSector, 0x60);
+    memset(queued, 0x61, sizeof(queued));
+    romCacheSdStore(collidingSector, queued);
+    romCacheSdStoreDrain(); // submit; mock leaves it in flight
+    romCacheSdWriteBegin();
+    require(romCacheSdWriteBarrierReady(),
+            "barrier did not drain its owned in-flight backfill");
+    romCacheSdWriteEnd();
+    require(!romCacheSdCheckHit(oldSector),
+            "old tag survived an abandoned colliding backfill");
+    require(!romCacheSdCheckHit(collidingSector),
+            "abandoned in-flight backfill published its new tag");
+
+    // An unowned worker request models a synchronous cache fetch preempted by
+    // F6. The barrier must wait without calling async_finish(), because the
+    // fetch waiter itself owns and must consume that DONE state.
+    sAsyncPsramPending = true;
+    sAsyncPsramCompletionReady = true;
+    romCacheSdWriteBegin();
+    require(!romCacheSdWriteBarrierReady(),
+            "barrier consumed an unowned synchronous worker request");
+    require(sAsyncPsramPending,
+            "unowned synchronous worker request was released by barrier");
+    sAsyncPsramPending = false; // model the synchronous waiter's release
+    require(romCacheSdWriteBarrierReady(),
+            "barrier stayed blocked after synchronous worker became idle");
+    romCacheSdWriteEnd();
 
     puts("rom cache consistency tests passed");
     return 0;

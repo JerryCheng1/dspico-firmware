@@ -254,6 +254,20 @@ int __time_critical_func(main)()
 
     multicore_launch_core1(core1_entry);
 
+#if defined(ENABLE_PSRAM_CACHE) && PSRAM_FORCE_BITBANG
+    // Finish every startup bit-bang burst before the cartridge PIO is enabled.
+    // Previously the probe began after initSd(), while NDSL could already be
+    // issuing its first mount commands on PIO0. A failed trace with no E3/SDIO
+    // read proved that even the probe-only activity could overlap and disrupt
+    // that handshake. The selected GPIO22-26/29 backend is independent of
+    // SDIO, so it can be qualified here while the cartridge interface is still
+    // inactive. Runtime cache traffic remains gated for the later warmup.
+    romCacheInit();
+    romCacheSdInit();
+    while (!romCacheQualificationFinished())
+        __wfe();
+#endif
+
     gpio_init_mask(PIN_INPUT_MASK);
     gpio_set_dir_in_masked(PIN_INPUT_MASK);
     gpio_init(PIN_IRQ);
@@ -371,6 +385,9 @@ int __time_critical_func(main)()
         "disabled (probe-only diagnostic)"
     #endif
     );
+    #if PSRAM_FORCE_BITBANG
+    LOG("[BOOT] PSRAM startup qualification: completed before cartridge PIO0\n");
+    #endif
 #endif
 
     resetNtrCard();
@@ -381,7 +398,7 @@ int __time_critical_func(main)()
 
     tryRebootToBootsel();
 
-#ifdef ENABLE_PSRAM_CACHE
+#if defined(ENABLE_PSRAM_CACHE) && !PSRAM_FORCE_BITBANG
     // SDIO initialization clears and reloads PIO1 instruction memory, so the
     // PIO1 SM2 PSRAM program must be installed only after the physical SD card
     // has completed its final high-speed initialization. Core1 qualifies the

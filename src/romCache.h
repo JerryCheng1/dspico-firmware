@@ -19,6 +19,12 @@ bool romCacheCore1Poll(void);
 ///        lookups miss and sectors are served from the SD card directly.
 bool romCacheIsAvailable(void);
 
+/// @brief Returns true when the startup PSRAM probe/qualification has reached
+///        a terminal result (available, absent, failed, or probe-only). The
+///        bit-bang build waits for this before enabling the cartridge PIO so
+///        startup PSRAM traffic can never overlap the NDSL mount handshake.
+bool romCacheQualificationFinished(void);
+
 
 // ---------------------------------------------------------------------------
 // SD sector cache (for the E3/E4/E5 block-device path used by pico-loader).
@@ -87,6 +93,24 @@ void romCacheSdStore(u32 sector, const u8* src);
 ///        from the core0 main loop (e.g. romCacheUpdate); never waits and must
 ///        NOT be called from PIO0_IRQ_0.
 void romCacheSdStoreDrain(void);
+
+/// @brief Begins an SD write transaction. Safe from PIO0_IRQ_0. New cache
+///        hits/backfills are blocked immediately and a queued, not-yet-started
+///        backfill is cancelled. The caller must wait for
+///        romCacheSdWriteBarrierReady() before starting the physical SD write.
+void romCacheSdWriteBegin(void);
+
+/// @brief Polls the SD write barrier. Returns true only after every PSRAM
+///        operation that was already running at romCacheSdWriteBegin() has
+///        completed and any unpublished backfill has been discarded. Never
+///        consumes a synchronous core1 cache-read completion owned by another
+///        context. Safe to poll from PIO0_IRQ_0 or the core0 main loop.
+bool romCacheSdWriteBarrierReady(void);
+
+/// @brief Ends an SD write transaction and allows cache hits/backfills again.
+///        Call only after the physical SD write (including a sequential chain)
+///        has completed.
+void romCacheSdWriteEnd(void);
 
 /// @brief Invalidates all SD sector cache lines.
 void romCacheSdInvalidate(void);
