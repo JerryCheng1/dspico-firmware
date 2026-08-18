@@ -1,0 +1,47 @@
+; APS6404L QSPI PSRAM data pump (RP2354A board, 4x APS6404L on a shared bus).
+;
+; Pin mapping:
+; - OUT/IN base: GPIO22 (PSRAM SIO0-IO3, 4 pins)
+; - side-set   : GPIO0  (PSRAM SCLK, shared by all four chips)
+; - CE0-3 (GPIO26-29, one per chip) and the serial command byte are handled
+;   by the CPU via SIO.
+;
+; Each burst starts with the nibble count - 1 in the SM's own TX FIFO; the
+; program pulls it into x itself. (Preloading x with an exec'd `out x, 32`
+; does not work: instructions exec'd on a disabled SM do not queue - each
+; SMx_INSTR write replaces the previous one - and with the OSR shift counter
+; at 0 the OUT does not autopull, so x ended up with stale OSR bits.)
+; After the last nibble the loop wraps back to the blocking pull, which parks
+; the SM with SCLK low until the CPU disables it - no stray clock edges.
+
+; Streams nibbles from the TX FIFO to IO0-IO3. Autopull must be enabled.
+; Data changes while SCLK is low, the PSRAM samples it on the rising edge.
+.program psram_qspi_tx
+.side_set 1 opt
+.wrap_target
+    pull block      side 0  ; x <- nibble count - 1, SCLK stays low
+    out x, 32       side 0
+tx_loop:
+    out pins, 4     side 0
+    jmp x-- tx_loop side 1
+.wrap
+
+; Samples nibbles from IO0-IO3 into the RX FIFO. Autopush must be enabled
+; (autopull must be OFF so the `out x, 32` cannot stall on an empty TX FIFO).
+; The PSRAM launches data on the falling edge. The input synchronizer delays
+; the sampled signal by ~2 sysclk, so sampling right after the rising edge
+; still lands inside the chip's tCLQV window and captures the PREVIOUS nibble
+; (seen on hardware as a uniform one-nibble lag: read = wrote >> 4). The
+; extra settle cycle moves the sample late into the high phase, ~4-6 sysclk
+; after the launch edge and just as far before the next one.
+.program psram_qspi_rx
+.side_set 1 opt
+.wrap_target
+    pull block      side 0  ; x <- nibble count - 1, SCLK stays low
+    out x, 32       side 0
+rx_loop:
+    nop             side 0  ; SCLK falls, chip launches the next nibble
+    nop             side 1  ; SCLK rises; let the nibble settle
+    in pins, 4      side 1  ; sample late in the high phase
+    jmp x-- rx_loop side 1  ; keep SCLK high
+.wrap

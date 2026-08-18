@@ -1,0 +1,659 @@
+#include "../common.h"
+#include <stdio.h>
+#include "pico/multicore.h"
+#include "hardware/clocks.h"
+#include "rp2350_sdio.h"
+#include "SdCardInfo.h"
+#include "SdCard.h"
+
+#define SEQUENTIAL_READ_TIMEOUT_MICROSECONDS    1000000 // 1 second
+
+sdio_status_t SdCard::Cmd0GoIdleState() const
+{
+    return rp2350_sdio_command_R1(CMD0, 0, NULL); // GO_IDLE_STATE
+}
+
+sdio_status_t SdCard::Cmd2AllSendCid(cid_t& cid) const
+{
+    return rp2350_sdio_command_R2(CMD2, 0, (u8*)&cid); // ALL_SEND_CID
+}
+
+sdio_status_t SdCard::Cmd3SendRelativeAddr(u32& rca) const
+{
+    return rp2350_sdio_command_R1(CMD3, 0, &rca);
+}
+
+sdio_status_t SdCard::Cmd7SelectCard(u32 rca) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD7, rca, &response);
+}
+
+sdio_status_t SdCard::Cmd8SendIfCond(u32 argument, u32& response) const
+{
+    return rp2350_sdio_command_R1(CMD8, argument, &response); // SEND_IF_COND
+}
+
+sdio_status_t SdCard::Cmd9SendCsd(u32 rca, csd_t& csd) const
+{
+    return rp2350_sdio_command_R2(CMD9, rca, (u8*)&csd);
+}
+
+sdio_status_t SdCard::Cmd12StopTransmission() const
+{
+    u32 response;
+    printf("[SDio] CMD12 send...\n");
+    sdio_status_t s = rp2350_sdio_command_R1(CMD12, 0, &response);
+    printf("[SDio] CMD12 done -> %d\n", (int)s);
+    return s;
+}
+
+sdio_status_t SdCard::Cmd16SetBlocklen(u32 blockLength) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(16, blockLength, &response);
+}
+
+sdio_status_t SdCard::Cmd17ReadSingleBlock(u32 address) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD17, address, &response);
+}
+
+sdio_status_t SdCard::Cmd18ReadMultipleBlock(u32 address) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD18, address, &response);
+}
+
+sdio_status_t SdCard::Cmd24WriteBlock(u32 address) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD24, address, &response);
+}
+
+sdio_status_t SdCard::Cmd25WriteMultipleBlock(u32 address) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD25, address, &response);
+}
+
+sdio_status_t SdCard::Cmd55AppCmd(u32 rca) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(CMD55, rca, &response); // APP_CMD
+}
+
+sdio_status_t SdCard::ACmd6SetBusWidth(u32 argument) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(ACMD6, argument, &response);
+}
+
+sdio_status_t SdCard::ACmd23SetWrBlkEraseCount(u32 count) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(ACMD23, count, &response);
+}
+
+sdio_status_t SdCard::ACmd41SdSendOpCond(u32 argument, u32& response) const
+{
+    return rp2350_sdio_command_R3(ACMD41, argument, &response); // SD_SEND_OP_COND
+}
+
+sdio_status_t SdCard::ACmd42SetClrCardDetect(u32 argument) const
+{
+    u32 response;
+    return rp2350_sdio_command_R1(ACMD42, argument, &response); // SET_CLR_CARD_DETECT
+}
+
+bool SdCard::TryInitialize()
+{
+    u32 reply;
+    sdio_status_t status;
+
+    // Initialize at ~403.225 kHz.
+    rp2350_sdio_init(62);
+
+    // Send a minimum of 74 clock cycles before the first command.
+    // This delay assumes a clock rate of 403.225 kHz.
+    // The CMD/CLK state machine must continuously clock the card for this to work.
+    sleep_us(183);
+
+    // Go into idle state.
+    Cmd0GoIdleState();
+
+    // Send interface/voltage support. Only SDv2 and up will respond.
+    // Voltage supplied (VHS) 2.7-3.6V plus check pattern.
+    status = Cmd8SendIfCond(0x1AA, reply);
+    if(status == SDIO_OK)
+    {
+        if(reply != 0x1AA)
+        {
+            return false;
+        }
+    }
+    else if(status != SDIO_ERR_RESPONSE_TIMEOUT)
+    {
+        return false;
+    }
+
+    // Send ACMD41 to begin card initialization and wait for it to complete.
+    // 3.2-3.3V, XPC = Maximum Performance, HCS set if SEND_IF_COND didn't time out.
+    const u32 opCondArg = SD_ACMD41_XPC | SD_OCR_3_2_3_3V | (status == SDIO_OK ? SD_ACMD41_HCS : 0u);
+    u32 start = millis();
+    do
+    {
+        if (Cmd55AppCmd(0) != SDIO_OK ||
+            ACmd41SdSendOpCond(opCondArg, _sdioOcr) != SDIO_OK)
+        {
+            return false;
+        }
+
+        if ((u32)(millis() - start) > 1000)
+        {
+            return false;
+        }
+    } while (!(_sdioOcr & SD_OCR_READY));
+
+    // Check if the voltage is supported.
+    if(!(_sdioOcr & SD_OCR_3_2_3_3V)) // 3.2-3.3V.
+    {
+    	return false;
+    }
+
+    // Get CID.
+    if (Cmd2AllSendCid(_sdioCid) != SDIO_OK)
+    {
+        return false;
+    }
+
+    // Get relative card address.
+    if (Cmd3SendRelativeAddr(_sdioRca) != SDIO_OK)
+    {
+        return false;
+    }
+
+    // Increase to 25 MHz clock rate.
+    // SD spec note:
+    // We can increase the clock after end of identification state.
+    rp2350_sdio_init(1);
+
+    // Get CSD.
+    if (Cmd9SendCsd(_sdioRca, _sdioCsd) != SDIO_OK)
+    {
+        return false;
+    }
+
+    // Select card.
+    if (Cmd7SelectCard(_sdioRca) != SDIO_OK)
+    {
+        return false;
+    }
+
+    // Disable DAT3 pull-up.
+    if (Cmd55AppCmd(_sdioRca) != SDIO_OK ||
+        ACmd42SetClrCardDetect(0) != SDIO_OK)
+    {
+        return false;
+    }
+
+    // Set 4-bit bus mode.
+    if (Cmd55AppCmd(_sdioRca) != SDIO_OK ||
+        ACmd6SetBusWidth(2) != SDIO_OK)
+    {
+        return false;
+    }
+
+    _lastSdSector = CalculateSdCapacity() - 1;
+
+    // dspico-debug: rp2350_sdio_init() above just reset the PIO/DMA, so any prior
+    // sequential-read/write bookkeeping is now stale. Clear it, otherwise the next
+    // disk_read (e.g. f_mount's boot-sector read after a re-init) routes through
+    // rp2350_sdio_rx_continue() against a stopped/blank PIO state machine and hangs.
+    _sequentialState = SequentialState::None;
+    _nextSequentialSector = 0xFFFFFFFFu;
+    _stopSequentialRead = false;
+    _doStopTransmission = false;
+
+    irq_set_exclusive_handler(TIMER0_IRQ_0, []
+    {
+        hw_clear_bits(&timer0_hw->intr, TIMER_INTR_ALARM_0_BITS);
+        gSdCard.NotifySequentialReadAlarm();
+    });
+
+    _state = State::Idle;
+
+    return true;
+}
+
+void SdCard::Update()
+{
+    while (true)
+    {
+        switch (_state)
+        {
+            case State::Idle:
+            {
+                if (_stopSequentialRead)
+                {
+                    _stopSequentialRead = false;
+                    if (_sequentialState == SequentialState::SequentialRead)
+                    {
+                        StopSequentialReadWrite();
+                    }
+                }
+                return;
+            }
+            case State::ReadBegin:
+            {
+                StateReadBegin();
+                break;
+            }
+            case State::ReadBusy:
+            {
+                StateReadBusy();
+                break;
+            }
+            case State::ReadWriteCancel:
+            {
+                StateReadWriteCancel();
+                break;
+            }
+            case State::WriteBegin:
+            {
+                StateWriteBegin();
+                break;
+            }
+            case State::WriteBusy:
+            {
+                StateWriteBusy();
+                break;
+            }
+            case State::Uninitialized:
+            default:
+            {
+                return;
+            }
+        }
+    }
+}
+
+void SdCard::StateReadBegin()
+{
+    u32 sectorsLeft = _sectorCount - _sectorsCompleted;
+    u32 startSector = _sectorAddress + _sectorsCompleted;
+    if (startSector > _lastSdSector)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    if ((u64)startSector + sectorsLeft - 1 > _lastSdSector)
+    {
+        sectorsLeft = _lastSdSector - startSector + 1;
+    }
+
+    if (sectorsLeft == 0)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    u32 sdAddress = startSector;
+    if (!IsSdhcCard())
+    {
+        sdAddress <<= 9; // for non-hc sd cards it's a byte address
+    }
+    
+    if (_cancelRequested)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    bool started = false;
+    if (_sequentialState == SequentialState::SequentialRead &&
+        _nextSequentialSector == startSector)
+    {
+        StopSequentialReadAlarm();
+        rp2350_sdio_rx_continue(_buffer + _sectorsCompleted * 512, sectorsLeft);
+        started = true;
+    }
+    else
+    {
+        if (_sequentialState != SequentialState::None)
+        {
+            StopSequentialReadWrite();
+        }
+
+        rp2350_sdio_rx_start(_buffer + _sectorsCompleted * 512, sectorsLeft);
+
+        if (_cancelRequested)
+        {
+            rp2350_sdio_stop();
+            _state = State::Idle;
+            return;
+        }
+
+        _doStopTransmission = true;
+        while (!_cancelRequested)
+        {
+            sdio_status_t s = Cmd18ReadMultipleBlock(sdAddress);
+            if (s == SDIO_OK)
+            {
+                started = true;
+                break;
+            }
+            // dspico-debug: bound the CMD18 launch attempts so a dead card cannot
+            // spin here forever; give up and let TryReadSectorsSync return false.
+            if (++_readStartRetries >= kMaxStartRetries)
+            {
+                StopSequentialReadWrite();
+                _state = State::Idle;
+                return;
+            }
+        }
+    }
+
+    if (_cancelRequested && started)
+    {
+        _state = State::ReadWriteCancel;
+    }
+    else
+    {
+        _state = State::ReadBusy;
+    }
+}
+
+void SdCard::StateReadBusy()
+{
+    if (_cancelRequested)
+    {
+        _state = State::ReadWriteCancel;
+        return;
+    }
+    auto blockStatus = rp2350_sdio_rx_poll_one_block();
+    switch (blockStatus)
+    {
+        case SDIO_BLOCK_CRC_FAIL:
+        case SDIO_BLOCK_TIMEOUT:
+        {
+            // dspico-debug: bound per-op block retries. The upstream driver loops
+            // ReadBegin->ReadBusy on every block error forever; without a cap a
+            // flaky/absent card wedges TryReadSectorsSync(). Give up after enough.
+            if (++_readSectorRetries >= kMaxSectorRetries)
+            {
+                StopSequentialReadWrite();
+                _state = State::Idle;
+                break;
+            }
+            StopSequentialReadWrite();
+            _state = State::ReadBegin; // restart from the failed sector
+            break;
+        }
+        case SDIO_BLOCK_OK:
+        {
+            _readSectorRetries = 0;
+            _sectorsCompleted++;
+            break;
+        }
+        case SDIO_BLOCK_ALL_DONE:
+        {
+            _sectorsCompleted = _sectorCount;
+            _nextSequentialSector = _sectorAddress + _sectorsCompleted;
+            _sequentialState = SequentialState::SequentialRead;
+            StartSequentialReadAlarm();
+            _state = State::Idle;
+            break;
+        }
+        case SDIO_BLOCK_NOT_READY:
+        default:
+        {
+            // dspico-debug: bounded wait instead of a bare __wfi(). During
+            // ReadBusy the only WFI wake source is DMA_IRQ_1; if a completion
+            // IRQ is ever lost (e.g. DMA stall), __wfi() sleeps forever and
+            // the 1000 ms timeout in rp2350_sdio_rx_poll_one_block() is never
+            // evaluated. A short spin lets the timeout path run.
+            busy_wait_us(50);
+            break;
+        }
+    }
+}
+
+void SdCard::StateReadWriteCancel()
+{
+    StopSequentialReadWrite();
+    _cancelRequested = false;
+    _state = State::Idle;
+}
+
+void SdCard::StateWriteBegin()
+{
+    _writeOffset = _sectorsCompleted;
+    u32 sectorsLeft = _sectorCount - _sectorsCompleted;
+    u32 startSector = _sectorAddress + _sectorsCompleted;
+    if (startSector > _lastSdSector)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    if ((u64)startSector + sectorsLeft - 1 > _lastSdSector)
+    {
+        sectorsLeft = _lastSdSector - startSector + 1;
+    }
+
+    if (sectorsLeft == 0)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    u32 sdAddress = startSector;
+    if (!IsSdhcCard())
+    {
+        sdAddress <<= 9; // for non-hc sd cards it's a byte address
+    }
+
+    if (_cancelRequested)
+    {
+        _state = State::Idle;
+        return;
+    }
+
+    if (_sequentialState == SequentialState::SequentialWrite &&
+        _nextSequentialSector == startSector)
+    {
+        StopSequentialReadAlarm();
+    }
+    else
+    {
+        if (_sequentialState != SequentialState::None)
+        {
+            StopSequentialReadWrite();
+        }
+
+        printf("[SDio] WriteBegin: sec=%lu left=%lu\n",
+               (unsigned long)startSector, (unsigned long)sectorsLeft);
+        _doStopTransmission = true;
+        bool started = false;
+        while (!_cancelRequested)
+        {
+            sdio_status_t s = Cmd25WriteMultipleBlock(sdAddress);
+            if (s == SDIO_OK)
+            {
+                started = true;
+                break;
+            }
+            printf("[SDio] WriteBegin: CMD25 -> %d\n", (int)s);
+            // dspico-debug: bound the CMD25 launch attempts (mirror of the read path).
+            if (++_writeStartRetries >= kMaxStartRetries)
+            {
+                printf("[SDio] WriteBegin: CMD25 retries exhausted\n");
+                StopSequentialReadWrite();
+                _state = State::Idle;
+                return;
+            }
+        }
+
+        if (_cancelRequested)
+        {
+            if (started)
+                _state = State::ReadWriteCancel;
+            else
+                _state = State::Idle;
+            return;
+        }
+    }
+
+    rp2350_sdio_tx_start(_buffer + _sectorsCompleted * 512, sectorsLeft);
+
+    if (_cancelRequested)
+        _state = State::ReadWriteCancel;
+    else
+        _state = State::WriteBusy;
+}
+
+void SdCard::StateWriteBusy()
+{
+    if (_cancelRequested)
+    {
+        _state = State::ReadWriteCancel;
+        return;
+    }
+
+    u32 bytesCompleted = 0;
+    auto status = rp2350_sdio_tx_poll(&bytesCompleted);
+    if (status != SDIO_BUSY)
+        printf("[SDio] WriteBusy: txpoll=%d bytes=%lu/%lu\n", (int)status,
+               (unsigned long)bytesCompleted, (unsigned long)(_sectorCount * 512));
+    switch (status)
+    {
+        case SDIO_BUSY:
+        {
+            _sectorsCompleted = _writeOffset + (bytesCompleted >> 9);
+            break;
+        }
+        case SDIO_OK:
+        {
+            _writeSectorRetries = 0;
+            _sectorsCompleted = _sectorCount;
+            _nextSequentialSector = _sectorAddress + _sectorsCompleted;
+            if (_keepSequentialWriteOpen)
+            {
+                _sequentialState = SequentialState::SequentialWrite;
+            }
+            else
+            {
+                StopSequentialReadWrite();
+            }
+            _state = State::Idle;
+            break;
+        }
+        default:
+        {
+            // bad things, retry
+            if (++_writeSectorRetries >= kMaxSectorRetries)
+            {
+                printf("[SDio] WriteBusy: sector retries exhausted\n");
+                StopSequentialReadWrite();
+                _state = State::Idle;
+                break;
+            }
+            StopSequentialReadWrite();
+            _state = State::WriteBegin; // restart from the failed sector
+            break;
+        }
+    }
+}
+
+void SdCard::StopSequentialReadWrite()
+{
+    printf("[SDio] Stop enter doStopTx=%d\n", (int)_doStopTransmission);
+    StopSequentialReadAlarm();
+    rp2350_sdio_stop();
+    printf("[SDio] Stop: sdio_stop done\n");
+    if (_doStopTransmission)
+    {
+        // dspico-debug: bound both loops. The upstream code spun forever here on
+        // a card that never answers CMD12 or never deasserts busy; that defeated
+        // every "give up" path above because they all route through this function.
+        u32 cmd12Tries = 0;
+        for (u32 i = 0; i < 16; i++)
+        {
+            sdio_status_t s = Cmd12StopTransmission();
+            cmd12Tries++;
+            if (s != SDIO_OK)
+                printf("[SDio] Stop: CMD12 try %lu -> %d\n", (unsigned long)(i + 1), (int)s);
+            else
+                break;
+        }
+        // After a large multi-block write the card can stay busy (D0 low) while
+        // it programs flash. SD spec worst-case is ~250-500 ms for a write; wait
+        // up to 500 ms. If it stays busy longer the card is wedged - continuing
+        // is better than blocking the test firmware for seconds per sector.
+        // dspico-debug: use busy_wait, NOT sleep_ms(). StopSequentialReadAlarm()
+        // (upstream driver) clears CLOCKS_SLEEP_EN1_CLK_SYS_TIMER, which gates
+        // the hardware timer clock while the CPU is in WFE sleep - so any
+        // sleep_ms() here would never wake up (timer frozen, alarm never fires).
+        printf("[SDio] Stop: busywait start busy=%d\n", IsCardBusy() ? 1 : 0);
+        u32 busyMs = 0;
+        for (u32 i = 0; i < 500; i++)
+        {
+            if (!IsCardBusy())
+                break;
+            busy_wait_us_32(1000);
+            busyMs++;
+            if ((busyMs % 100) == 0)
+                printf("[SDio] Stop: busywait %lums busy=%d\n",
+                       (unsigned long)busyMs, IsCardBusy() ? 1 : 0);
+        }
+        printf("[SDio] Stop: CMD12 tries=%lu busyMs=%lu\n",
+               (unsigned long)cmd12Tries, (unsigned long)busyMs);
+    }
+    _sequentialState = SequentialState::None;
+    _stopSequentialRead = false;
+}
+
+void SdCard::StartSequentialReadAlarm()
+{
+    _stopSequentialRead = false;
+    irq_set_enabled(TIMER0_IRQ_0, false);
+    hw_set_bits(&clocks_hw->sleep_en1, CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS);
+    hw_set_bits(&clocks_hw->wake_en1, CLOCKS_WAKE_EN1_CLK_SYS_TIMER0_BITS);
+    hw_set_bits(&timer0_hw->armed, 1);
+    hw_clear_bits(&timer0_hw->intr, TIMER_INTR_ALARM_0_BITS);
+    hw_set_bits(&timer0_hw->inte, TIMER_INTE_ALARM_0_BITS);
+    irq_set_enabled(TIMER0_IRQ_0, true);
+    u64 target = timer0_hw->timerawl + SEQUENTIAL_READ_TIMEOUT_MICROSECONDS;
+    timer0_hw->alarm[0] = (u32)target;
+}
+
+void SdCard::StopSequentialReadAlarm()
+{
+    irq_set_enabled(TIMER0_IRQ_0, false);
+    // dspico-debug: do NOT clear CLOCKS_SLEEP_EN1/WAKE_EN1_CLK_SYS_TIMER here
+    // (the upstream driver did). WAKE_EN1 gates clk_sys_timer in NORMAL mode,
+    // so clearing it freezes the hardware timer outright - every later
+    // sleep_ms()/busy_wait()/timeout in the firmware hangs forever. The bits
+    // default to set (and StartSequentialReadAlarm sets them again anyway).
+}
+
+u32 SdCard::CalculateSdCapacity() const
+{
+    if (_sdioCsd.v1.csd_ver == 0)
+    {
+        u16 cSize = (_sdioCsd.v1.c_size_high << 10) | (_sdioCsd.v1.c_size_mid << 2) | _sdioCsd.v1.c_size_low;
+        u8 cSizeMult = (_sdioCsd.v1.c_size_mult_high << 1) | _sdioCsd.v1.c_size_mult_low;
+        return (u32)(cSize + 1) << (cSizeMult + _sdioCsd.v1.read_bl_len - 7);
+    }
+    else if (_sdioCsd.v2.csd_ver == 1)
+    {
+        return (((u32)_sdioCsd.v2.c_size_high << 16) + ((u16)_sdioCsd.v2.c_size_mid << 8) + _sdioCsd.v2.c_size_low + 1) << 10;
+    }
+    else
+    {
+        return 0;
+    }
+}
