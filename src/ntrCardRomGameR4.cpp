@@ -35,21 +35,21 @@ static DWORD sSaveClusterTab[4096];
 
 extern FATFS sFatFs;
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4DummyCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4DummyCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     ntrc_writeWord(pio, 0);
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetCardInfoCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetCardInfoCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     ntrc_writeWord(pio, 0x1F4);
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSaveReadCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartSaveReadCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     u32 addr = word << 8;
@@ -68,19 +68,19 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSaveReadCmd0(ntr_rom_emu_t* 
     romEmu->wordIdx = 1;
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSaveDataCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetSaveDataCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 512);
     ntrc_dmaToBus(sR4SaveBlock, 512);
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSaveDataCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetSaveDataCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_finishGameNoScrambleCmd1(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSaveStatCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4GetSaveStatCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     u32 sdStat = 1;
@@ -92,7 +92,7 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4GetSaveStatCmd0(ntr_rom_emu_t* ro
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4SendMapCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4SendMapCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
 
@@ -147,7 +147,7 @@ static void __no_inline_not_in_flash_func(gameR4StartRomReadCmd0Cont)(ntr_rom_em
     romEmu->wordIdx = 1;
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartRomReadCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartRomReadCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 4);
     u32 addr = romEmu->cmd0 << 8;
@@ -156,46 +156,44 @@ extern "C" void __scratch_y("cpu0") ntrc_gameR4StartRomReadCmd0(ntr_rom_emu_t* r
     gameR4StartRomReadCmd0Cont(romEmu);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSaveWriteCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartSaveWriteCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginRead(pio, 512);
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
-static void __scratch_y("cpu0") r4SaveWritePayloadComplete(ntr_rom_emu_t* romEmu)
+static void __time_critical_func(r4SaveWritePayloadComplete)(ntr_rom_emu_t* romEmu)
 {
     sWriteSaveAddr = romEmu->cmd0 << 8;
     sSaveWriteBusy = true;
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameR4StartSaveWriteCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameR4StartSaveWriteCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_finishGameNoScrambleCmd1WithReadPayload(romEmu, (u32*)sR4SaveBlock, 512, r4SaveWritePayloadComplete);
 }
 
-extern "C" void __scratch_y("cpu0") ntrc_gameNoScrambleReadPageCmd0(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
+extern "C" void __time_critical_func(ntrc_gameNoScrambleReadPageCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
     ntrc_beginWrite(pio, 512);
+    // The payload DMA must start at the cmd0 half: the SM leaves cmd_loop one
+    // instruction after the last command byte and stalls at `pull ifempty`
+    // until data arrives. Starting the DMA at cmd1 (upstream) makes the
+    // response late whenever the cmd1 IRQ is delayed - the SM misses the
+    // console's first response strobes and the bus desyncs.
 #ifdef ENABLE_R4_MODE
     if (romEmu->r4Mode)
     {
         u32 address = romEmu->cmd0 << 8;
         ntrc_dmaToBus(&sR4RomBlockLarge[address & 0x3FFF], 512);
     }
-#endif
-    ntrc_finishGameNoScrambleCmd0(romEmu);
-}
-
-extern "C" void __scratch_y("cpu0") ntrc_gameNoScrambleReadPageCmd1(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
-{
-#ifdef ENABLE_R4_MODE
-    if (!romEmu->r4Mode)
+    else
 #endif
     {
         //just send some garbage
         ntrc_dmaToBus(sR4RomBlockLarge, 512);
     }
-    ntrc_finishGameNoScrambleCmd1(romEmu);
+    ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 
 static void initFileFromFatEntry(FIL* file, u32 fatEntryAddr, bool save)

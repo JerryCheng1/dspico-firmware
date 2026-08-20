@@ -127,6 +127,12 @@ void ntrc_gameCmd1Dummy(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio);
 /// @param length The length of the data to send. Must be a multiple of 4.
 void ntrc_dmaToBus(const void* data, u32 length);
 
+/// @brief Cold-boot SD pre-warm. Synchronously reads sector 0 into the cart
+///        sector cache right after mount, so the loader's first E3/E4 answers
+///        ready from cache instead of storming while the card does its
+///        power-on housekeeping. Call once before entering the main loop.
+void ntrc_gameSdPrewarm(void);
+
 #ifdef ENABLE_R4_MODE
 void ntrc_gameR4Update(void);
 void ntrc_resetR4(void);

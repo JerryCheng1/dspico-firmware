@@ -1,9 +1,5 @@
-; RP2040 PIO program for implementing SD card access in SDIO mode
-; Run "pioasm rp2040_sdio.pio rp2040_sdio.pio.h" to regenerate the C header from this.
-
-; The RP2040 official work-in-progress code at
-; https://github.com/raspberrypi/pico-extras/tree/master/src/rp2_common/pico_sd_card
-; may be useful reference, but this is independent implementation.
+; RP2350 PIO program for implementing SD card access in SDIO mode
+; The build generates rp2350_sdio.pio.h with pico_generate_pio_header().
 ;
 ; For official SDIO specifications, refer to:
 ; https://www.sdcard.org/downloads/pls/
@@ -14,15 +10,14 @@
 ; - Default speed: max. 25 MHz clock
 ; - High speed:    max. 50 MHz clock
 ;
-; From the default RP2040 clock speed of 125 MHz, the closest dividers
-; are 3 for 41.7 MHz and 5 for 25 MHz. The CPU can apply further divider
-; through state machine registers for the initial handshake.
+; The RP2354A build runs clk_sys at 200 MHz. CLKDIV=8 below produces a
+; 25 MHz SD clock; the CPU applies a further state-machine divider during the
+; initial handshake.
 ;
 ; Because data is written on the falling edge and read on the rising
 ; edge, it is preferrable to have a long 0 state and short 1 state.
 ;.define CLKDIV 3
 ; .define CLKDIV 5
-;for 200MHz base clock
 .define CLKDIV 8
 .define D0 ((CLKDIV + 1) / 2 - 1)
 .define D1 (CLKDIV/2 - 1)
@@ -53,11 +48,14 @@
 .program sdio_cmd_clk
     .side_set 1
 
+    mov OSR, NULL       side 1 [D1]    ; Make sure OSR is full of zeros to prevent autopull
+
 wait_cmd:
-    mov Y, !STATUS      side 1 [D1]    ; Check if TX FIFO has data
-    jmp !Y wait_cmd     side 0 [D0]
+    mov Y, !STATUS      side 0 [D0]    ; Check if TX FIFO has data
+    jmp !Y wait_cmd     side 1 [D1]
 
 load_cmd:
+    out NULL, 32        side 0 [D0]    ; Load first word (trigger autopull)
     out X, 8            side 1 [D1]    ; Number of bits to send
     set pins, 1         side 0 [D0]    ; Initial state of CMD is high
     set pindirs, 1      side 1 [D1]    ; Set SDIO_CMD as output

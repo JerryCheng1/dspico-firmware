@@ -4,20 +4,14 @@
 extern "C" {
 #endif
 
-/// @brief Initializes power saving.
+/// @brief Selects the conservative RP2350 ordinary-WFI power policy.
 void pwr_initPowerSaving(void);
 
-/// @brief Enables additional power saving for when unscrambled game mode has been reached.
+/// @brief Keeps RP2350 PIO/DMA wake clocks available in unscrambled game mode.
 void pwr_enableAfterBootPowerSaving(void);
 
-/// @brief Disables additional power saving such that scrambling can be used again.
+/// @brief Keeps RP2350 PIO/DMA wake clocks available when scrambling resumes.
 void pwr_disableAfterBootPowerSaving(void);
-
-/// @brief Disables USB power saving, such that USB can be used.
-void pwr_disableUsbPowerSaving(void);
-
-/// @brief Enables USB power saving. USB can no longer be used.
-void pwr_enableUsbPowerSaving(void);
 
 #ifdef __cplusplus
 }

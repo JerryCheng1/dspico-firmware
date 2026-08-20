@@ -1,5 +1,5 @@
 #pragma once
-#include "rp2040_sdio.h"
+#include "rp2350_sdio.h"
 #include "SdCardInfo.h"
 
 class SdCard
@@ -16,6 +16,10 @@ public:
     /// @brief Returns if the SD card is currently writing.
     /// @return \c true if the SD card is writing, or \c false otherwise.
     bool IsWriting() const { return _state == State::WriteBegin || _state == State::WriteBusy; }
+
+    /// @brief Starts concise UART tracing for loader-time SD reads. Physical
+    ///        FatFs mount traffic before this call is intentionally omitted.
+    void EnableRuntimeDiagnostics() { _runtimeDiagnostics = true; }
 
     /// @brief Tries to begin a read at the given \p sector and sector \p count. The data will be written to the \p dst buffer.
     /// @param dst The destination buffer.
@@ -75,9 +79,28 @@ public:
     /// @brief Updates the SD state machine.
     void Update();
 
+    /// @brief Performs one bounded, non-blocking read-completion poll from the
+    ///        cartridge IRQ. This never starts/retries/stops a transaction and
+    ///        never waits; it only makes an already DMA-complete read visible
+    ///        before the loader's current E4 status response is returned.
+    void PollReadCompletionFromCartridgeIrq();
+
+    /// @brief Starts a queued read from the E3/E5 cartridge IRQ before the
+    ///        loader can begin its high-priority E4 polling burst. The SD data
+    ///        transfer remains asynchronous; this call never waits for data.
+    /// @return true when the queued request reached ReadBusy.
+    bool KickPendingReadFromCartridgeIrq();
+
     /// @brief Returns the number of sectors that have been completed in the current read or write.
     /// @return The number of sectors that have been completed in the current read or write.
     u32 GetSectorsCompleted() const { return _sectorsCompleted; }
+
+    // Hang-diagnostics heartbeat (DSPICO_HANG_DIAGNOSTIC): raw state machine
+    // snapshot so a TIMER1 IRQ can report where the core0 main loop is even
+    // when it is stuck inside Update().
+    int DebugState() const { return (int)_state; }
+    int DebugSequentialState() const { return (int)_sequentialState; }
+    u32 DebugSectorAddress() const { return _sectorAddress; }
 
     /// @brief Reads the given number of sectors from the given \p sector to the \p dst buffer.
     ///        This function blocks until the read is complete.
@@ -143,6 +166,9 @@ private:
     volatile u32 _sectorsCompleted;
     u8* _buffer;
     bool _doStopTransmission;
+    bool _runtimeDiagnostics = false;
+    bool _traceCurrentRead = false;
+    u32 _diagnosticReadCount = 0;
     bool _keepSequentialWriteOpen;
     u32 _writeOffset;
 
@@ -166,14 +192,14 @@ private:
     sdio_status_t Cmd25WriteMultipleBlock(u32 address) const;
     sdio_status_t Cmd55AppCmd(u32 rca) const;
     sdio_status_t ACmd6SetBusWidth(u32 argument) const;
+    sdio_status_t ACmd42ClrCardDetect() const;
     sdio_status_t ACmd23SetWrBlkEraseCount(u32 count) const;
     sdio_status_t ACmd41SdSendOpCond(u32 argument, u32& response) const;
-    sdio_status_t ACmd42SetClrCardDetect(u32 argument) const;
 
     bool IsSdhcCard() const { return (_sdioOcr & (1 << 30)) != 0; }
     bool IsCardBusy() const { return (sio_hw->gpio_in & (1 << SDIO_D0)) == 0; }
 
-    void StateReadBegin();
+    void StateReadBegin(bool singleCommandAttempt = false);
     void StateReadBusy();
     void StateReadWriteCancel();
     void StateWriteBegin();

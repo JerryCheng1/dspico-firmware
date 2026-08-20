@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.13)
 #set(PICO_SDK_PATH "../FIRMWARE/pico-sdk") # enable this if vscode or cmake complains about PICO_SDK_PATH not being set
+set(PICO_PLATFORM rp2350 CACHE STRING "Target RP platform")
+set(PICO_BOARD dspico_rp2354a CACHE STRING "Target board")
+list(APPEND PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/src/boards)
+list(REMOVE_DUPLICATES PICO_BOARD_HEADER_DIRS)
+if(NOT PICO_SDK_PATH)
+  if(DEFINED ENV{PICO_SDK_PATH})
+    set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
+  else()
+    set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/pico-sdk)
+  endif()
+endif()
 include(pico_sdk_import.cmake)
 project(DSpico_project C CXX ASM)
 set(CMAKE_C_STANDARD 11)
@@ -9,12 +20,23 @@ add_compile_definitions(DSpico
   PICO_STACK_SIZE=0x600
   PICO_CORE1_STACK_SIZE=0x400
   ENABLE_R4_MODE
+  $<$<BOOL:${ENABLE_UART_LOG}>:ENABLE_UART_LOG>
+  # TRACE_QUIET_LOG: with ENABLE_UART_LOG, keeps the tracers (rings, counters,
+  # quiet/fault dumps) but silences the per-event LOG stream so the main loop
+  # runs at nodebug speed. For catching nodebug-only failures in the act.
+  $<$<BOOL:${TRACE_QUIET_LOG}>:TRACE_QUIET_LOG>
   #DSPICO_ENABLE_WRFUXXED # This macro enables the WRFUXXED exploit to work.
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
 
+# Unique per-build tag printed on the UART boot banner so each flashed build is
+# verifiable. Pass -DUART_LOG_BUILD_TAG=... at configure time.
+set(UART_LOG_BUILD_TAG "" CACHE STRING "Boot banner build tag override")
+
 add_executable(DSpico
   src/main.cpp
+  src/uartLog.c
+  src/uartLog.h
   src/common.h
   src/romData.S
   src/romData.h
@@ -36,24 +58,6 @@ add_executable(DSpico
   src/ntrCardRomGameNoScramble.h
   src/ntrCardRomGameSd.cpp
   src/ntrCardRomGameR4.cpp
-  src/ntrCardRomGameUsb.cpp
-  src/ntrCardRomGameUsb.h
-  src/usbEventQueue.c
-  src/usbEventQueue.h
-  src/tinyusb/dcd_rp2040.c
-  src/tinyusb/rp2040_usb.c
-  src/tinyusb/rp2040_usb.h
-  src/tinyusb/dcd.h
-  src/tinyusb/tusb_option.h
-  src/tinyusb/tusb_compiler.h
-  src/tinyusb/tusb_common.h
-  src/tinyusb/tusb_config.h
-  src/tinyusb/tusb_mcu.h
-  src/tinyusb/tusb_verify.h
-  src/tinyusb/tusb_types.h
-  src/tinyusb/tusb_debug.h
-  src/tinyusb/osal.h
-  src/tinyusb/osal_none.h
   src/ntrCardSpiUart.c
   src/ntrCardSpiUart.h
   src/wrfuxxed.h
@@ -62,8 +66,8 @@ add_executable(DSpico
   src/xor.h
   src/ntrCardIrq.S
   src/r4.h
-  src/sd/rp2040_sdio.cpp
-  src/sd/rp2040_sdio.h
+  src/sd/rp2350_sdio.cpp
+  src/sd/rp2350_sdio.h
   src/sd/SdCardInfo.h
   src/sd/SdCardInfo.h
   src/sd/SdCard.cpp
@@ -82,9 +86,15 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/roms/default.nds" AND EXISTS "${CMAKE_SOURCE_DIR}
   )
 endif()
 
-pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
-pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2040_sdio.pio)
+# Unique per-build tag printed on the UART boot banner so each flashed build is
+# verifiable. Pass -DUART_LOG_BUILD_TAG=... at configure time.
+if(UART_LOG_BUILD_TAG)
+  target_compile_definitions(DSpico PRIVATE UART_LOG_BUILD_TAG="${UART_LOG_BUILD_TAG}")
+endif()
 
-pico_enable_stdio_uart(DSpico 1)
+pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
+pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2350_sdio.pio)
+
+pico_enable_stdio_uart(DSpico 0)
 pico_add_extra_outputs(DSpico)
 target_link_libraries(DSpico pico_stdlib hardware_pio hardware_dma pico_multicore)

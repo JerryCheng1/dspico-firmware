@@ -107,10 +107,44 @@ To compile and properly use the firmware, you will need to place a valid DS rom 
 </table>
 
 ## Compiling
-Simply run `./compile.sh` to compile the firmware. Once it is complete, you will be able to find `DSpico.uf2` in the `build/` folder, which you can use to flash your DSpico board with.
+This branch (`v1.0.1-rp2350`) targets the RP2354A (RP2350A) and requires **pico-sdk 2.3.0 or newer**. The RP2040-oriented `compile.sh` from the main branch does not apply here; build with CMake directly.
+
+The SDK ships as the `pico-sdk` submodule (checked out at 2.3.0), and `CMakeLists.txt` already defaults `PICO_SDK_PATH` to it and sets `PICO_PLATFORM=rp2350` and `PICO_BOARD=dspico_rp2354a` (board definition in `src/boards/`). So a full build is a single command:
+
+```bash
+git submodule update --init pico-sdk && cmake -DCMAKE_BUILD_TYPE=Release -B build && cmake --build build -j$(nproc)
+```
+
+Outputs land in `build/`: `DSpico.uf2` (flash via BOOTSEL) and `DSpico.elf`.
+
+To build against a different SDK checkout instead of the submodule, set `PICO_SDK_PATH` (environment variable or `-DPICO_SDK_PATH=...`) at configure time.
 
 > [!IMPORTANT]
-> The firmware only works correctly when build with optimization. Recommended is `RelWithDebInfo`.
+> The firmware only works correctly when built with optimization. Use `Release` (or `RelWithDebInfo`).
+
+### Build options (pass with `-D` at configure time)
+| Option | Effect |
+|---|---|
+| `ENABLE_UART_LOG=ON` | Diagnostic build: deferred UART log (GPIO0 TX, 115200 8N1), failure/quiet dumps, RX/E4-FIFO/SD-event trace rings, logic-analyzer trigger on GPIO0. The log drain only runs while the cartridge bus is quiet, so it does not disturb normal operation. |
+| `TRACE_QUIET_LOG=ON` | Requires `ENABLE_UART_LOG=ON`. Keeps every tracer and the dumps but silences the per-event log stream, so the main loop runs at nodebug speed. Use it to catch failures that only reproduce in the nodebug build. |
+| `UART_LOG_BUILD_TAG=<name>` | Tag printed on the UART boot banner so a flashed build is identifiable from its log. Bump it on every build. |
+
+The three variants used during development:
+
+```bash
+# nodebug (shipping candidate): no options
+cmake -DCMAKE_BUILD_TYPE=Release -B build-nodebug .
+
+# diag: full logging
+cmake -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_UART_LOG=ON -DUART_LOG_BUILD_TAG=my-diag -B build-diag .
+
+# traceq: nodebug speed, tracers only
+cmake -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_UART_LOG=ON -DTRACE_QUIET_LOG=ON -DUART_LOG_BUILD_TAG=my-traceq -B build-traceq .
+```
+
+For the diagnostic build, connect a UART adapter to GPIO0 (TX, 115200 8N1) to read the log output.
 
 ## License
 
