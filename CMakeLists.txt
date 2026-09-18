@@ -21,6 +21,10 @@ add_compile_definitions(DSpico
   PICO_CORE1_STACK_SIZE=0x400
   ENABLE_R4_MODE
   $<$<BOOL:${ENABLE_UART_LOG}>:ENABLE_UART_LOG>
+  # ENABLE_SD_WRITE_PROTECT - SD card write protection: every SD write (DS-side
+  # SD/R4 commands and the FatFs disk_write path) is silently swallowed so the
+  # card contents cannot be modified, while reads keep working normally.
+  $<$<BOOL:${ENABLE_SD_WRITE_PROTECT}>:ENABLE_SD_WRITE_PROTECT>
   # TRACE_QUIET_LOG: with ENABLE_UART_LOG, keeps the tracers (rings, counters,
   # quiet/fault dumps) but silences the per-event LOG stream so the main loop
   # runs at nodebug speed. For catching nodebug-only failures in the act.

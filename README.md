@@ -58,6 +58,7 @@ The `CMakeList.txt` file contains a couple of options that you can configure.
       * Note that to be able to use R4 software, your SD card must be at most 4 GB, or have a single partition in the first 4 GB of the SD card. R4 card commands cannot address SD sectors above 4 GB!
    * `DSPICO_ENABLE_WRFUXXED` - Enables emulation of the IS-SPI-USB-ADAPTER to support the WRFUxxed exploit. This requires <code>uartBufv060.bin</code> to be placed in the `data/` folder.
    * `ENABLE_PREVENT_DSI_AUTOBOOT` - Experimental feature that prevents DSi consoles from autobooting when the autoboot flag is set. It was intended to be used with WRFU Tester, which has the autoboot flag set. It is generally not recommended to use this, as it does not work properly with the 3DS and has not been tested much.
+   * `ENABLE_SD_WRITE_PROTECT` - SD card write protection. When enabled, every SD card write (DS-side SD/R4 card commands and the FatFs `disk_write()` path) is silently swallowed: the write is reported as successful without any data being sent to the card, so its contents cannot be modified. Reads are unaffected. Configure with `-DENABLE_SD_WRITE_PROTECT=ON`.
 
 ### Setting up the rom(s)
 To compile and properly use the firmware, you will need to place a valid DS rom in the `roms/` folder, named `default.nds`. Additionally, you may include a second rom in the `roms/` folder named `dsimode.nds`, if you wish to have a different rom for DS consoles and DSi/3DS consoles.

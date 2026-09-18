@@ -5,6 +5,13 @@
 class SdCard
 {
 public:
+#ifdef ENABLE_SD_WRITE_PROTECT
+    /// @brief Compile-time flag: \c true when SD card write protection is built in.
+    static constexpr bool WRITE_PROTECT_ENABLED = true;
+#else
+    static constexpr bool WRITE_PROTECT_ENABLED = false;
+#endif
+
     /// @brief Tries to initialize the SD card.
     /// @return \c true if initialization was successful, or \c false otherwise.
     bool TryInitialize();
@@ -42,6 +49,10 @@ public:
         return true;
     }
 
+    /// @brief Whether SD card write protection is compiled in.
+    /// @return \c true when the ENABLE_SD_WRITE_PROTECT feature macro is set.
+    static constexpr bool IsWriteProtected() { return WRITE_PROTECT_ENABLED; }
+
     /// @brief Tries to begin a write to the given \p sector and sector \p count. The data will be read from the \p src buffer.
     /// @param src The source buffer.
     /// @param sector The sector to start writing at.
@@ -57,6 +68,26 @@ public:
             return false;
         }
 
+#ifdef ENABLE_SD_WRITE_PROTECT
+        // SD card write protection (compile-time, see ENABLE_SD_WRITE_PROTECT).
+        // This is the single chokepoint every write path funnels through: the
+        // DS-side SD (F6) commands, the R4 emulated writes and the FatFs
+        // disk_write() glue. We silently swallow the request instead of
+        // issuing any write command to the card: the sectors are reported as
+        // already completed and the state machine returns to Idle, so callers
+        // that block on IsReady()/TryWriteSectorsSync() (or that trap a false
+        // return with __breakpoint()) all see a fast, successful write while
+        // the card contents stay untouched. Reads are unaffected.
+        (void)src;
+        (void)keepSequentialWriteOpen;
+        _buffer = nullptr;
+        _sectorAddress = sector;
+        _sectorCount = count;
+        _sectorsCompleted = count;
+        _cancelRequested = false;
+        _state = State::Idle;
+        return true;
+#else
         _buffer = (u8*)src;
         _sectorAddress = sector;
         _sectorCount = count;
@@ -65,6 +96,7 @@ public:
         _keepSequentialWriteOpen = keepSequentialWriteOpen;
         _state = State::WriteBegin;
         return true;
+#endif
     }
 
     /// @brief Requests a cancel of the current read or write.
