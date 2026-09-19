@@ -2,9 +2,10 @@
 ############################
 Debug/
 Release/
-build/
+build*/
 cmake-build*/
 out/
+test*/
 
 # Compiled source #
 ###################
@@ -28,6 +29,7 @@ out/
 *.rar
 *.tar
 *.zip
+*.md
 
 # Logs and databases #
 ######################
