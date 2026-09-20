@@ -10,8 +10,14 @@
 
 // Blocking init-stage logging: unlike LOG (async ring), these flush even if
 // the code halts right after the failure, so f_mount=FAIL is diagnosable.
+// Kept under ENABLE_UART_LOG (boot-time only) independently of the cartridge
+// runtime tracers.
 #ifdef ENABLE_UART_LOG
 #define SD_LOG(...) do { uartLogPrintfBlocking(__VA_ARGS__); } while (0)
+#else
+#define SD_LOG(...) do { } while (0)
+#endif
+#ifdef ENABLE_CART_TRACE
 // Timestamp (us) of the last completed cartridge-initiated read - paired with
 // gCartSdLastE4Us in the heartbeat to tell "E4 polls stopped before the read
 // finished" (read too slow / loader timeout) from "polls stopped while the
@@ -23,8 +29,6 @@ extern "C" {
 volatile u32 gSdEvtIdx;
 u32 gSdEvtRing[64];
 }
-#else
-#define SD_LOG(...) do { } while (0)
 #endif
 
 sdio_status_t SdCard::Cmd0GoIdleState() const
@@ -487,7 +491,7 @@ void SdCard::StateReadBusy()
             if (_traceCurrentRead)
                 LOG("[sdio] read#%lu all done\n",
                     (unsigned long)_diagnosticReadCount);
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
             extern volatile u32 gSdAllDoneUs;
             gSdAllDoneUs = time_us_32();
 #endif

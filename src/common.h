@@ -4,6 +4,16 @@
 #include "pico/time.h"
 #ifdef ENABLE_UART_LOG
 #include "uartLog.h"
+#endif
+
+// Cartridge-runtime diagnostics (ENABLE_CART_TRACE, see CMakeLists.txt): PIO
+// IRQ rx trace, E4 FIFO ring, E3/E4/E5 counters + SD event ring, GPIO0
+// logic-analyzer trigger, running heartbeat, auto dumps, TIMER0_IRQ_1 stuck
+// detector and the deferred log ring. Strictly separate from ENABLE_UART_LOG:
+// a plain UART-log build must not add a single instruction to the hard
+// real-time cartridge path (PIO0 IRQ, GPIO IRQ, DMA IRQ, timer IRQ, E3/E4/E5
+// handlers).
+#if defined(ENABLE_UART_LOG) && defined(ENABLE_CART_TRACE)
 // Deferred diagnostic log: LOG formats into an in-RAM ring immediately but the
 // UART drain happens ONLY while the cartridge bus has been quiet (no CEB fall
 // for >1 ms). Blocking prints in the main loop stretch the E3->ready=1 answer
@@ -56,7 +66,7 @@ typedef volatile int64_t vs64;
 //        4=RD_CMD18_FAIL(tries) 5=RD_BLOCK_OK(done) 6=RD_CRC_FAIL
 //        7=RD_TIMEOUT 8=RD_ALLDONE(us) 9=E3_REQ(sector) 10=E4_READY(us)
 //        11=E4_READY_CACHED(us) 12=KICK(cmd0hi<<8|relPc) 13=E5_FETCH(word)
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && defined(ENABLE_CART_TRACE)
 #ifdef __cplusplus
 extern "C" {
 #endif

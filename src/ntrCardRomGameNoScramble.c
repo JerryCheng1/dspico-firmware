@@ -5,7 +5,7 @@
 #include "powerSaving.h"
 #include "ntrCardRomGameNoScramble.h"
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 extern volatile u32 gCartSdDummyCmd0;
 extern volatile u32 gCartSdUnknownCmd1;
 extern volatile u32 gCartSdUnknownWord;
@@ -19,7 +19,7 @@ extern volatile u32 gCartSdE4LenArmed;
 
 void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gCartSdUnknownCmd1++;
     // Raw words for the deferred [cart] line: real command caught in a
     // desync vs. pure garbage distinguishes decoder misalignment from a
@@ -42,7 +42,7 @@ void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* p
 
 void __time_critical_func(ntrc_gameNoScrambleCmd0Dummy)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gCartSdDummyCmd0++;
 #endif
     ntrc_finishGameNoScrambleCmd0(romEmu);

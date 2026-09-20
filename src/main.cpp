@@ -84,7 +84,7 @@ static void resetNtrCard(void)
 static u64 sResetStart;
 #endif
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 static volatile u32 sCartCebAborts;
 static volatile u32 sCartCebFalls;
 static volatile u32 sCartCebFallStuck;
@@ -93,7 +93,7 @@ static volatile u32 sCebPhantomFall;
 static volatile u32 sCartLastAbortUs;
 static volatile u32 sCartLastAbortPc;
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 // --- Crash triage -------------------------------------------------------
 // pico-sdk's default fault handlers are `bkpt #0` (isr_hardfault et al.),
 // which without a debugger escalates straight to silent LOCKUP - exactly the
@@ -151,7 +151,7 @@ static void dbgEnableFaults(void)
 }
 #endif
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 // --- Deferred diagnostic log --------------------------------------------
 // See common.h. The ring is written only from the core0 main loop (LOG call
 // sites are all inside SdCard::Update()/this file) and drained only while the
@@ -299,7 +299,7 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
 #endif
     if (gpio == PIN_CEB)
     {
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
         if (events & GPIO_IRQ_EDGE_FALL)
         {
             // Command-start counting + bus-quiet timestamp for the deferred
@@ -336,7 +336,7 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
         u32 relPc = pio_sm_get_pc(pio0, 0) - sProgramOffset;
         if ((gpio_get(PIN_CEB) & 1u) == 0)
         {
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
             sCebPhantomRise++;
 #endif
             return;
@@ -375,7 +375,7 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
             SD_EVT(12, ((gNtrRomEmu.cmd0 >> 24) << 8) | (relPc & 0xFFu));
             irq_clear(PIO0_IRQ_0);
             irq_set_enabled(PIO0_IRQ_0, true);
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
             sCartCebAborts++;
             sCartLastAbortUs = time_us_32();
             sCartLastAbortPc = relPc;
@@ -484,7 +484,7 @@ static inline void earlyGpioInit(void)
     // Note that we rely on hardware reset having enabled pull-downs.
     gpio_init_mask(0xFFFFFFFFu);
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     // GPIO0 = logic-analyzer trigger output (raised when the first ready=1 E4
     // answer is queued, dropped when E5 fires). On this no-PSRAM baseline the
     // pin only reaches the unused PSRAM CLK pad, so driving it is harmless.
@@ -587,7 +587,7 @@ static inline void earlyGpioInit(void)
 #endif
 }
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 // Boundary trace: every main-loop iteration records the cart SM PC (relative
 // to the ntr_card program start), the CEB line level and the E4/E5 counters.
 // The ring freezes 48 iterations after the first ready=1 answer and dumps, so
@@ -720,6 +720,8 @@ int __time_critical_func(main)()
     set_sys_clock_khz(200000, true);
 #ifdef ENABLE_UART_LOG
     uartLogInit();
+#endif
+#ifdef ENABLE_CART_TRACE
     dbgEnableFaults();
 #endif
 
@@ -830,7 +832,7 @@ int __time_critical_func(main)()
 
     pwr_initPowerSaving();
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     dbgWakeTimerInit();
     // Loader-time read tracing: [sdio] read#N lines show CMD18 / block / retry
     // progress of the first 8 cartridge reads. Without this the SD side of the
@@ -844,7 +846,7 @@ int __time_critical_func(main)()
     {
         gSdCard.Update();
         gSdCard.Update();
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
         {
             extern volatile u32 gCartSdE4Polls, gCartSdE5Reads, gCartSdE4Ready;
             if (!sCartTraceDumped)
@@ -1021,7 +1023,7 @@ int __time_critical_func(main)()
     #ifdef ENABLE_R4_MODE
         ntrc_gameR4Update();
     #endif
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
         // Drain deferred diagnostics while the cart bus is quiet; sleep only
         // when there is nothing left to print (a non-empty backlog keeps the
         // loop spinning so the next read's completion is still detected

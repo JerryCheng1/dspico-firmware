@@ -20,18 +20,41 @@ add_compile_definitions(DSpico
   PICO_STACK_SIZE=0x600
   PICO_CORE1_STACK_SIZE=0x400
   ENABLE_R4_MODE
+  # ENABLE_UART_LOG - UART init plus BOOT-TIME logging only (SD bring-up,
+  # f_mount, prewarm). It must NOT enable any runtime tracing: once the NDS
+  # starts talking to the cartridge the build has to behave exactly like
+  # ENABLE_UART_LOG=OFF. In particular it must not add work to PIO0_IRQ_0,
+  # the GPIO/DMA/timer IRQs or the E3/E4/E5 command handlers.
   $<$<BOOL:${ENABLE_UART_LOG}>:ENABLE_UART_LOG>
+  # ENABLE_CART_TRACE - cartridge-runtime diagnostics: PIO IRQ rx trace, E4
+  # FIFO ring, E3/E4/E5 counters + SD event ring, GPIO0 logic-analyzer trigger,
+  # running heartbeat, quiet/early-abort auto dumps, TIMER0_IRQ_1 stuck
+  # detector and the deferred log ring. Off by default and never implied by
+  # ENABLE_UART_LOG; enable one diagnostic mechanism at a time.
+  $<$<BOOL:${ENABLE_CART_TRACE}>:ENABLE_CART_TRACE>
   # ENABLE_SD_WRITE_PROTECT - SD card write protection: every SD write (DS-side
   # SD/R4 commands and the FatFs disk_write path) is silently swallowed so the
   # card contents cannot be modified, while reads keep working normally.
   $<$<BOOL:${ENABLE_SD_WRITE_PROTECT}>:ENABLE_SD_WRITE_PROTECT>
-  # TRACE_QUIET_LOG: with ENABLE_UART_LOG, keeps the tracers (rings, counters,
+  # TRACE_QUIET_LOG: with ENABLE_CART_TRACE, keeps the tracers (rings, counters,
   # quiet/fault dumps) but silences the per-event LOG stream so the main loop
   # runs at nodebug speed. For catching nodebug-only failures in the act.
   $<$<BOOL:${TRACE_QUIET_LOG}>:TRACE_QUIET_LOG>
   #DSPICO_ENABLE_WRFUXXED # This macro enables the WRFUXXED exploit to work.
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
+
+# Runtime-diagnostic switches. Both default OFF and are independent: a plain
+# UART log build (ENABLE_UART_LOG=ON, ENABLE_CART_TRACE=OFF) only emits
+# boot-time output and leaves the real-time cartridge path untouched.
+option(ENABLE_UART_LOG "Boot-time UART logging (no runtime tracing)" OFF)
+option(ENABLE_CART_TRACE "Cartridge runtime diagnostics (requires ENABLE_UART_LOG)" OFF)
+if(ENABLE_CART_TRACE AND NOT ENABLE_UART_LOG)
+  message(FATAL_ERROR
+    "ENABLE_CART_TRACE requires ENABLE_UART_LOG=ON: the runtime tracers emit "
+    "their output through the UART log, which is compiled in only with "
+    "ENABLE_UART_LOG=ON.")
+endif()
 
 # Unique per-build tag printed on the UART boot banner so each flashed build is
 # verifiable. Pass -DUART_LOG_BUILD_TAG=... at configure time.

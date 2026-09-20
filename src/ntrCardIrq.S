@@ -23,7 +23,7 @@ ntrc_pioIrq:
     lsls r3, r3, #23
     bmi pioIrqEmpty
     ldr r1, [r2, #(PIO0_RXF0 - PIO0_BASE)]
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     // Ground-truth trace: every dispatched RX word plus the SM PC (SM0_ADDR,
     // absolute) at dispatch time, into a 64-entry ring. A late dispatch shows
     // up as pc >= cmd_loop end (the SM already waiting on the length word),

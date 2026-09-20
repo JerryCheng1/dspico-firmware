@@ -5,6 +5,8 @@
 #include "ntrCardRomGameNoScramble.h"
 #ifdef ENABLE_UART_LOG
 #include "uartLog.h"
+#endif
+#ifdef ENABLE_CART_TRACE
 extern "C" {
 volatile u32 gCartSdE3Requests;
 volatile u32 gCartSdE4Polls;
@@ -40,7 +42,7 @@ u32 gE5TraceTail[8][2];
 // command arriving with a pre-armed word pending must drain it first (see
 // E3/E5/F6 + the CEB-rise recovery in main.cpp).
 volatile u32 gCartSdE4LenArmed;
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
 // TX FIFO level + pre-arm flag sampled at E4 cmd0 dispatch. Healthy mid-storm
 // reads "level 0, armed": the SM already holds the length in its OSR.
 volatile u32 gE4FlIdx;
@@ -80,7 +82,7 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd0)(ntr_rom_emu_t* romEm
 
 extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gCartSdE3Requests++;
 #endif
     sCurSdSector = 0xFFFFFFFF;
@@ -102,9 +104,9 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd1)(ntr_rom_emu_t* romEm
 
 extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_UART_LOG
-    // Sampled at dispatch, committed after the pushes so the diag build keeps
-    // the no-debug build's response timing.
+#ifdef ENABLE_CART_TRACE
+    // Sampled at dispatch, committed after the pushes so the trace build keeps
+    // the no-trace build's response timing.
     u8 flAtEntry = (u8)((pio->flevel & 0xFu) | (gCartSdE4LenArmed ? 0x10u : 0));
     u32 readyEvt = 0;
 #endif
@@ -128,7 +130,7 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEm
         if (sSdSectorBuffersSectors[sBufferIndex] == sReadSector)
         {
             sdReady = true;
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
             readyEvt = 11; // ready from already-buffered sector
 #endif
         }
@@ -137,7 +139,7 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEm
             sSdSectorBuffersSectors[sBufferIndex] = sReadSector;
             sdReady = true;
             sReadBusy = false;
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
             readyEvt = 10; // ready latched from a finished SD read
 #endif
         }
@@ -162,7 +164,7 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEm
         ntrc_beginWrite(pio, 4);
         gCartSdE4LenArmed = 1;
     }
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gCartSdE4Polls++;
     gCartSdLastE4Us = time_us_32();
     gE4FlRing[gE4FlIdx++ & 15] = flAtEntry;
@@ -203,12 +205,12 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdDataCmd0)(ntr_rom_emu_t* romEm
     }
     ntrc_beginWrite(pio, 512);
 
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gpio_put_masked(1u << 0, 0); // boundary covered: drop the trigger line
 #endif
 
     // without scrambling to save time
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     gCartSdE5Reads++;
     // Phantom-ready evidence: this E5's buffer was never latched by an E4
     // ready answer, so the DMA below serves an unfilled buffer. Must be
@@ -221,7 +223,7 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdDataCmd0)(ntr_rom_emu_t* romEm
     // matching E5 word in the rx ring - if that reproduces, this arg is the
     // smoking gun (not 0xE5000000 => wild dispatch path).
     SD_EVT(13, word);
-#ifdef ENABLE_UART_LOG
+#ifdef ENABLE_CART_TRACE
     {
         u32 t = gE5TraceCount;
         if (t < 8)
