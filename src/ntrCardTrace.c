@@ -43,6 +43,11 @@
 #define TRACE_TX_MASK       (TRACE_TX_SIZE - 1u)
 #define TRACE_TX_BUDGET     32u
 
+// Core1 must remain a bounded observer.  A full trace ring is diagnostic
+// loss, never a reason to monopolise the shared SRAM/interconnect while the
+// cartridge service core is handling a burst.
+#define TRACE_CONSUME_BUDGET_RECORDS 8u
+
 // A batch of diagnostics may only start when the cartridge bus has been idle
 // for this long and CEB is high.
 #define TRACE_QUIET_US      2000u
@@ -129,18 +134,29 @@ static u32 sTxW;
 static u32 sTxR;
 static u32 sTxDropped;
 
+static u32 traceTxFree(void)
+{
+    u32 used = sTxW - sTxR;
+    if (used >= TRACE_TX_SIZE)
+        return 0;
+    // Keep one slot empty so the ring's full and empty states differ.
+    return TRACE_TX_SIZE - used - 1u;
+}
+
 static void traceTxPush(const char* p, u32 n)
 {
+    // A diagnostic line is indivisible.  Publishing a prefix and dropping
+    // its tail makes the UART stream misleading, while dropping the whole
+    // line is harmless and explicitly counted.
+    if (n > traceTxFree())
+    {
+        sTxDropped++;
+        return;
+    }
     for (u32 i = 0; i < n; i++)
     {
-        u32 next = (sTxW + 1u) & TRACE_TX_MASK;
-        if (next == sTxR)
-        {
-            sTxDropped++;
-            return;
-        }
-        sTx[sTxW] = p[i];
-        sTxW = next;
+        sTx[sTxW & TRACE_TX_MASK] = p[i];
+        sTxW++;
     }
 }
 
@@ -174,7 +190,7 @@ static void traceTxPump(void)
 
 static bool traceTxSpace(u32 needed)
 {
-    return (TRACE_TX_SIZE - (sTxW - sTxR)) > needed + 1u;
+    return needed <= traceTxFree();
 }
 
 // ---- DMA / ring -----------------------------------------------------------
@@ -244,7 +260,7 @@ static void traceTriggerAnomaly(u32 id, u32 seq)
     sDumpCount = n;
 }
 
-static void traceDecode(u32 cmd0, u32 cmd1)
+static void traceDecode(u32 cmd0, u32 cmd1, u32 tUs)
 {
     u32 id = cmd0 >> 24;
     u32 seq = sTotal;
@@ -269,7 +285,7 @@ static void traceDecode(u32 cmd0, u32 cmd1)
     trace_record_t* r = &sHistory[sHistoryCount & TRACE_HISTORY_MASK];
     r->cmd0 = cmd0;
     r->cmd1 = cmd1;
-    r->tUs = time_us_32();
+    r->tUs = tUs;
     sHistoryCount++;
 
     if (sSeenE3)
@@ -299,14 +315,20 @@ static void traceConsume(void)
         available = produced - sConsumed;
     }
 
-    while (available >= 2u)
+    // One timer read timestamps the bounded batch.  Per-command timestamps
+    // are not worth repeated APB traffic on the observer core; command order
+    // remains exact in the raw DMA ring.
+    u32 batchUs = time_us_32();
+    u32 records = 0;
+    while (available >= 2u && records < TRACE_CONSUME_BUDGET_RECORDS)
     {
         u32 cmd0 = sTraceRing[sConsumed & TRACE_RING_MASK];
         u32 cmd1 = sTraceRing[(sConsumed + 1u) & TRACE_RING_MASK];
         sConsumed += 2u;
         available -= 2u;
-        sLastBusUs = time_us_32();
-        traceDecode(cmd0, cmd1);
+        sLastBusUs = batchUs;
+        traceDecode(cmd0, cmd1, batchUs);
+        records++;
     }
 }
 
@@ -427,13 +449,24 @@ void ntrCardTraceInit(void)
 
     dspicoPioSmSetEnabled(pio0, sTraceSm, true);
     sTraceReady = true;
+    // Core1 waits while the listener is unavailable during boot.  Wake it
+    // only after the listener and its DMA sink are fully configured.
+    __sev();
 }
 
 void ntrCardTraceCore1Poll(void)
 {
     if (!sTraceReady)
+    {
+        __wfe();
         return;
+    }
     traceConsume();
+    // Do not begin or continue UART output while an observed transaction is
+    // active.  The trace writer is on core1, but bounded output still uses
+    // shared peripheral/interconnect resources and must yield to the bus.
+    if (!traceBusQuiet())
+        return;
     traceTxPump();
     traceMaybeEmit();
     traceTxPump();

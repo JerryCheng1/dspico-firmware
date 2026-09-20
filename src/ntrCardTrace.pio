@@ -8,7 +8,8 @@
 ; Framing mirrors the ntr_card service program:
 ;   - wait CEB falling edge,
 ;   - sample D0..D7 on the WREB rising edge that the service program also uses,
-;   - eight edges make command word 0, eight more make command word 1,
+;   - eight edges make the complete 8-byte command: autopush emits its two
+;     32-bit words ({cmd0,cmd1}) after bytes 4 and 8,
 ;   - wait for CEB to rise and start the next transaction.
 ;
 ; Autopush (32-bit, shift left, threshold 32) emits exactly the two {cmd0,cmd1}
