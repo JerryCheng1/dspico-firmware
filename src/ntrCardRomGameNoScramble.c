@@ -5,13 +5,6 @@
 #include "powerSaving.h"
 #include "ntrCardRomGameNoScramble.h"
 
-#ifdef ENABLE_CART_TRACE
-extern volatile u32 gCartSdDummyCmd0;
-extern volatile u32 gCartSdUnknownCmd1;
-extern volatile u32 gCartSdUnknownWord;
-extern volatile u32 gCartSdUnknownCmd0;
-#endif
-
 // Functional (not just diagnostic): set while an E4 poll pre-armed length
 // word sits in the TX FIFO. pio_sm_clear_fifos below drops that word, so the
 // flag must go with it.
@@ -19,14 +12,6 @@ extern volatile u32 gCartSdE4LenArmed;
 
 void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_CART_TRACE
-    gCartSdUnknownCmd1++;
-    // Raw words for the deferred [cart] line: real command caught in a
-    // desync vs. pure garbage distinguishes decoder misalignment from a
-    // console-side protocol we do not implement.
-    gCartSdUnknownWord = word;
-    gCartSdUnknownCmd0 = romEmu->cmd0;
-#endif
     // Upstream disabled PIO0_IRQ_0 here ("do not receive further commands
     // until card reset") and blocking-printed - a transient desync (a lost
     // transaction leaving a partial RX stream, r66 boot 3: D=1 -> U=1) then
@@ -42,9 +27,6 @@ void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* p
 
 void __time_critical_func(ntrc_gameNoScrambleCmd0Dummy)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-#ifdef ENABLE_CART_TRACE
-    gCartSdDummyCmd0++;
-#endif
     ntrc_finishGameNoScrambleCmd0(romEmu);
 }
 

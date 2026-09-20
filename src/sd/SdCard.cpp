@@ -17,19 +17,6 @@
 #else
 #define SD_LOG(...) do { } while (0)
 #endif
-#ifdef ENABLE_CART_TRACE
-// Timestamp (us) of the last completed cartridge-initiated read - paired with
-// gCartSdLastE4Us in the heartbeat to tell "E4 polls stopped before the read
-// finished" (read too slow / loader timeout) from "polls stopped while the
-// read was already done" (SM went deaf and commands stopped dispatching).
-volatile u32 gSdAllDoneUs;
-// SD event ring backing store (see common.h SD_EVT). extern "C" so the cart
-// handlers and the dump can share it across C/C++ TUs.
-extern "C" {
-volatile u32 gSdEvtIdx;
-u32 gSdEvtRing[64];
-}
-#endif
 
 sdio_status_t SdCard::Cmd0GoIdleState() const
 {
@@ -339,13 +326,6 @@ void __time_critical_func(SdCard::StateReadBegin)(bool singleCommandAttempt)
 {
     u32 sectorsLeft = _sectorCount - _sectorsCompleted;
     u32 startSector = _sectorAddress + _sectorsCompleted;
-    SD_EVT(1, startSector);
-    _traceCurrentRead = _runtimeDiagnostics && ++_diagnosticReadCount <= 8;
-    if (_traceCurrentRead && !singleCommandAttempt)
-        LOG("[sdio] read#%lu begin sector=%lu count=%lu seq=%u\n",
-            (unsigned long)_diagnosticReadCount, (unsigned long)startSector,
-            (unsigned long)sectorsLeft,
-            (unsigned)(_sequentialState == SequentialState::SequentialRead));
     if (startSector > _lastSdSector)
     {
         _state = State::Idle;
@@ -381,10 +361,6 @@ void __time_critical_func(SdCard::StateReadBegin)(bool singleCommandAttempt)
     {
         StopSequentialReadAlarm();
         rp2350_sdio_rx_continue(_buffer + _sectorsCompleted * 512, sectorsLeft);
-        SD_EVT(2, sectorsLeft);
-        if (_traceCurrentRead && !singleCommandAttempt)
-            LOG("[sdio] read#%lu RX continue\n",
-                (unsigned long)_diagnosticReadCount);
         started = true;
     }
     else
@@ -395,9 +371,6 @@ void __time_critical_func(SdCard::StateReadBegin)(bool singleCommandAttempt)
         }
 
         rp2350_sdio_rx_start(_buffer + _sectorsCompleted * 512, sectorsLeft);
-        if (_traceCurrentRead && !singleCommandAttempt)
-            LOG("[sdio] read#%lu RX armed, sending CMD18\n",
-                (unsigned long)_diagnosticReadCount);
 
         if (_cancelRequested)
         {
@@ -419,12 +392,6 @@ void __time_critical_func(SdCard::StateReadBegin)(bool singleCommandAttempt)
             if (singleCommandAttempt)
                 break;
         }
-        if (_traceCurrentRead && !singleCommandAttempt)
-            LOG("[sdio] read#%lu CMD18 %s attempts=%lu\n",
-                (unsigned long)_diagnosticReadCount,
-                started ? "OK" : "cancelled",
-                (unsigned long)commandAttempts);
-        SD_EVT(started ? 3 : 4, commandAttempts);
     }
 
     if (singleCommandAttempt && !started && !_cancelRequested)
@@ -467,34 +434,17 @@ void SdCard::StateReadBusy()
         case SDIO_BLOCK_CRC_FAIL:
         case SDIO_BLOCK_TIMEOUT:
         {
-            SD_EVT(blockStatus == SDIO_BLOCK_CRC_FAIL ? 6 : 7, _sectorsCompleted);
-            if (_traceCurrentRead)
-                LOG("[sdio] read#%lu block %s, retry\n",
-                    (unsigned long)_diagnosticReadCount,
-                    blockStatus == SDIO_BLOCK_CRC_FAIL ? "CRC fail" : "timeout");
             StopSequentialReadWrite();
             _state = State::ReadBegin; // restart from the failed sector
             break;
         }
         case SDIO_BLOCK_OK:
         {
-            if (_traceCurrentRead)
-                LOG("[sdio] read#%lu block OK\n",
-                    (unsigned long)_diagnosticReadCount);
             _sectorsCompleted++;
-            SD_EVT(5, _sectorsCompleted);
             break;
         }
         case SDIO_BLOCK_ALL_DONE:
         {
-            SD_EVT(8, time_us_32());
-            if (_traceCurrentRead)
-                LOG("[sdio] read#%lu all done\n",
-                    (unsigned long)_diagnosticReadCount);
-#ifdef ENABLE_CART_TRACE
-            extern volatile u32 gSdAllDoneUs;
-            gSdAllDoneUs = time_us_32();
-#endif
             _sectorsCompleted = _sectorCount;
             _nextSequentialSector = _sectorAddress + _sectorsCompleted;
             _sequentialState = SequentialState::SequentialRead;

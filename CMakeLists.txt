@@ -26,20 +26,17 @@ add_compile_definitions(DSpico
   # ENABLE_UART_LOG=OFF. In particular it must not add work to PIO0_IRQ_0,
   # the GPIO/DMA/timer IRQs or the E3/E4/E5 command handlers.
   $<$<BOOL:${ENABLE_UART_LOG}>:ENABLE_UART_LOG>
-  # ENABLE_CART_TRACE - cartridge-runtime diagnostics: PIO IRQ rx trace, E4
-  # FIFO ring, E3/E4/E5 counters + SD event ring, GPIO0 logic-analyzer trigger,
-  # running heartbeat, quiet/early-abort auto dumps, TIMER0_IRQ_1 stuck
-  # detector and the deferred log ring. Off by default and never implied by
-  # ENABLE_UART_LOG; enable one diagnostic mechanism at a time.
+  # ENABLE_CART_TRACE - non-intrusive cartridge-runtime diagnostics: a PIO0
+  # input listener observes the physical CEB/WREB/D0..D7 bus, an IRQ-less DMA
+  # channel stores the raw command words in an SRAM ring, and core1 decodes
+  # them and emits bounded non-blocking UART text. It adds nothing to
+  # PIO0_IRQ_0, the GPIO/DMA/timer IRQs or the E3/E4/E5 handlers. Off by
+  # default and never implied by ENABLE_UART_LOG.
   $<$<BOOL:${ENABLE_CART_TRACE}>:ENABLE_CART_TRACE>
   # ENABLE_SD_WRITE_PROTECT - SD card write protection: every SD write (DS-side
   # SD/R4 commands and the FatFs disk_write path) is silently swallowed so the
   # card contents cannot be modified, while reads keep working normally.
   $<$<BOOL:${ENABLE_SD_WRITE_PROTECT}>:ENABLE_SD_WRITE_PROTECT>
-  # TRACE_QUIET_LOG: with ENABLE_CART_TRACE, keeps the tracers (rings, counters,
-  # quiet/fault dumps) but silences the per-event LOG stream so the main loop
-  # runs at nodebug speed. For catching nodebug-only failures in the act.
-  $<$<BOOL:${TRACE_QUIET_LOG}>:TRACE_QUIET_LOG>
   #DSPICO_ENABLE_WRFUXXED # This macro enables the WRFUXXED exploit to work.
   # ENABLE_PREVENT_DSI_AUTOBOOT # meant to be used with WRFU, doesn't work properly on the 3ds
 )
@@ -92,6 +89,9 @@ add_executable(DSpico
   src/xor.S
   src/xor.h
   src/ntrCardIrq.S
+  src/ntrCardTrace.c
+  src/ntrCardTrace.h
+  src/ntrCardTrace.pio
   src/r4.h
   src/sd/rp2350_sdio.cpp
   src/sd/rp2350_sdio.h
@@ -120,6 +120,7 @@ if(UART_LOG_BUILD_TAG)
 endif()
 
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
+pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCardTrace.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2350_sdio.pio)
 
 pico_enable_stdio_uart(DSpico 0)

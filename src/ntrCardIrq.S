@@ -23,25 +23,6 @@ ntrc_pioIrq:
     lsls r3, r3, #23
     bmi pioIrqEmpty
     ldr r1, [r2, #(PIO0_RXF0 - PIO0_BASE)]
-#ifdef ENABLE_CART_TRACE
-    // Ground-truth trace: every dispatched RX word plus the SM PC (SM0_ADDR,
-    // absolute) at dispatch time, into a 64-entry ring. A late dispatch shows
-    // up as pc >= cmd_loop end (the SM already waiting on the length word),
-    // and a desynced stream shows up directly in the word bytes. ~15 cycles.
-    push {r4}
-    ldr r3,= gRxTraceIdx
-    ldr r12, [r3]
-    adds r12, r12, #1
-    str r12, [r3]
-    subs r12, r12, #1
-    ands r12, r12, #63
-    ldr r3,= gRxTrace
-    str r1, [r3, r12, lsl #2]
-    ldrb r4, [r2, #0xD4]        // SM0_ADDR
-    ldr r3,= gRxTracePc
-    strb r4, [r3, r12]
-    pop {r4}
-#endif
     ldr r3, [r0, #8] //wordIdx
     cmp r3, #2
         bge payload

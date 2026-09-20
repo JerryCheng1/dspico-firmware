@@ -24,10 +24,6 @@ public:
     /// @return \c true if the SD card is writing, or \c false otherwise.
     bool IsWriting() const { return _state == State::WriteBegin || _state == State::WriteBusy; }
 
-    /// @brief Starts concise UART tracing for loader-time SD reads. Physical
-    ///        FatFs mount traffic before this call is intentionally omitted.
-    void EnableRuntimeDiagnostics() { _runtimeDiagnostics = true; }
-
     /// @brief Tries to begin a read at the given \p sector and sector \p count. The data will be written to the \p dst buffer.
     /// @param dst The destination buffer.
     /// @param sector The sector to start reading at.
@@ -127,6 +123,10 @@ public:
     /// @return The number of sectors that have been completed in the current read or write.
     u32 GetSectorsCompleted() const { return _sectorsCompleted; }
 
+    /// @brief Returns the number of sectors requested in the current read or write.
+    /// @return The sector count of the active request.
+    u32 GetSectorCount() const { return _sectorCount; }
+
     // Hang-diagnostics heartbeat (DSPICO_HANG_DIAGNOSTIC): raw state machine
     // snapshot so a TIMER1 IRQ can report where the core0 main loop is even
     // when it is stuck inside Update().
@@ -198,9 +198,6 @@ private:
     volatile u32 _sectorsCompleted;
     u8* _buffer;
     bool _doStopTransmission;
-    bool _runtimeDiagnostics = false;
-    bool _traceCurrentRead = false;
-    u32 _diagnosticReadCount = 0;
     bool _keepSequentialWriteOpen;
     u32 _writeOffset;
 

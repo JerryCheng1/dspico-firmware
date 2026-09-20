@@ -6,38 +6,18 @@
 #include "uartLog.h"
 #endif
 
-// Cartridge-runtime diagnostics (ENABLE_CART_TRACE, see CMakeLists.txt): PIO
-// IRQ rx trace, E4 FIFO ring, E3/E4/E5 counters + SD event ring, GPIO0
-// logic-analyzer trigger, running heartbeat, auto dumps, TIMER0_IRQ_1 stuck
-// detector and the deferred log ring. Strictly separate from ENABLE_UART_LOG:
-// a plain UART-log build must not add a single instruction to the hard
-// real-time cartridge path (PIO0 IRQ, GPIO IRQ, DMA IRQ, timer IRQ, E3/E4/E5
-// handlers).
+// Cartridge-runtime diagnostics (ENABLE_CART_TRACE, see CMakeLists.txt).
+// The design requires that diagnostics are a side channel: a dedicated PIO
+// listener captures the physical command words, an IRQ-less DMA ring stores
+// them, and core1 decodes them and emits bounded UART text. Nothing on this
+// path may run inside PIO0_IRQ_0, the GPIO/DMA/timer IRQs or the E3/E4/E5
+// handlers, so the real-time cartridge path is identical to a build without
+// ENABLE_CART_TRACE. Strictly separate from ENABLE_UART_LOG.
 #if defined(ENABLE_UART_LOG) && defined(ENABLE_CART_TRACE)
-// Deferred diagnostic log: LOG formats into an in-RAM ring immediately but the
-// UART drain happens ONLY while the cartridge bus has been quiet (no CEB fall
-// for >1 ms). Blocking prints in the main loop stretch the E3->ready=1 answer
-// past the DLDI driver's per-read deadline (115200 baud is ~87 us/char; four
-// [sdio] lines per read = ~10 ms vs a ~8 ms budget - r66's intermittent mount
-// failures). Deferring keeps full diagnostics at zero bus-latency cost. When
-// the main loop wedges, the priority-0 wake probe force-flushes the ring, so
-// the last line still shows the last step that actually ran (the r63 property
-// the blocking LOG was introduced for).
-void dbgDeferLog(const char* fmt, ...);
-// TRACE_QUIET_LOG (diag builds only): keep every tracer (rx/e4fl rings,
-// counters, quiet dump, fault dump) but silence the per-event LOG stream.
-// The full diag build formats each event with vsnprintf on the main loop
-// (~10 us per line, on the block-completion path); that slowdown is the last
-// remaining difference between the 20/20 diag build and the still-flaky
-// nodebug build. This variant keeps the main loop at nodebug speed so a
-// nodebug-only failure leaves its rings behind for the quiet dump.
-#ifdef TRACE_QUIET_LOG
-#define LOG(...)    ((void)0)
+#include "ntrCardTrace.h"
+#define NTRC_TRACE_ENABLED 1
 #else
-#define LOG(...)    dbgDeferLog(__VA_ARGS__)
-#endif
-#else
-#define LOG(...)    ((void)0)
+#define NTRC_TRACE_ENABLED 0
 #endif
 
 typedef uint8_t u8;
@@ -57,33 +37,6 @@ typedef volatile uint32_t vu32;
 typedef volatile int32_t vs32;
 typedef volatile uint64_t vu64;
 typedef volatile int64_t vs64;
-
-// SD-side event ring: one SRAM word per event, no formatting, safe from the
-// cart IRQ. Survives TRACE_QUIET_LOG so a sleeping-main-loop build still
-// shows where the read pipeline stopped (traceq failing boot: 107 busy E4
-// polls, zero SD visibility). Printed by cartTraceDump on the failure dumps.
-// Codes: 1=RD_BEGIN(sector) 2=RD_RXCONT(left) 3=RD_CMD18_OK(tries)
-//        4=RD_CMD18_FAIL(tries) 5=RD_BLOCK_OK(done) 6=RD_CRC_FAIL
-//        7=RD_TIMEOUT 8=RD_ALLDONE(us) 9=E3_REQ(sector) 10=E4_READY(us)
-//        11=E4_READY_CACHED(us) 12=KICK(cmd0hi<<8|relPc) 13=E5_FETCH(word)
-#if defined(ENABLE_UART_LOG) && defined(ENABLE_CART_TRACE)
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern volatile u32 gSdEvtIdx;
-extern u32 gSdEvtRing[64];
-#ifdef __cplusplus
-}
-#endif
-// Atomic slot claim: writers are the cart IRQ (0x00), gpioIrq (0x80) and the
-// main loop - a plain idx++ races across all three and scrambles exactly the
-// same-microsecond failure clusters the ring exists to capture.
-#define SD_EVT(code, arg) \
-    (gSdEvtRing[__atomic_fetch_add(&gSdEvtIdx, 1u, __ATOMIC_RELAXED) & 63u] = \
-        (((u32)(code) << 28) | ((u32)(arg) & 0x0FFFFFFFu)))
-#else
-#define SD_EVT(code, arg) ((void)0)
-#endif
 
 #define SD_USE_SDIO
 

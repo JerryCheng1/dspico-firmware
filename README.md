@@ -127,8 +127,7 @@ To build against a different SDK checkout instead of the submodule, set `PICO_SD
 | Option | Effect |
 |---|---|
 | `ENABLE_UART_LOG=ON` | Boot-time UART logging only (UART1 on the USB_DP pad, 115200 8N1): SD bring-up, `f_mount` and prewarm milestones. Adds no work to the runtime cartridge path - once the NDS starts talking to the card the build behaves exactly like the nodebug build. |
-| `ENABLE_CART_TRACE=ON` | Requires `ENABLE_UART_LOG=ON`. Cartridge-runtime diagnostics: deferred log, RX/E4-FIFO/SD-event trace rings, E3/E4/E5 counters, GPIO0 logic-analyzer trigger, running heartbeat, quiet/early-abort auto dumps and the `TIMER0_IRQ_1` stuck detector. Adds work to the hard real-time cartridge path; enable only while diagnosing, and only one mechanism at a time. |
-| `TRACE_QUIET_LOG=ON` | Requires `ENABLE_CART_TRACE=ON`. Keeps every tracer and the dumps but silences the per-event log stream, so the main loop runs at nodebug speed. Use it to catch failures that only reproduce in the nodebug build. |
+| `ENABLE_CART_TRACE=ON` | Requires `ENABLE_UART_LOG=ON`. Non-intrusive cartridge diagnostics: a PIO0 input listener observes CEB/WREB/D0..D7, an IRQ-less DMA ring stores the raw command words, and core1 decodes them and prints bounded, non-blocking UART text with SD/cache snapshots. Nothing is added to `PIO0_IRQ_0`, the GPIO/DMA/timer IRQs or the E3/E4/E5 handlers, so a trace build is instruction-identical to the boot-log build on the real-time cartridge path. |
 | `UART_LOG_BUILD_TAG=<name>` | Tag printed on the UART boot banner so a flashed build is identifiable from its log. Bump it on every build. |
 
 The variants used during development:
@@ -141,14 +140,10 @@ cmake -DCMAKE_BUILD_TYPE=Release -B build-nodebug .
 cmake -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_UART_LOG=ON -DUART_LOG_BUILD_TAG=my-bootlog -B build-bootlog .
 
-# full cartridge trace (diag): rings, counters, dumps, heartbeat
+# non-intrusive cartridge trace: PIO listener + DMA ring + core1 decode
 cmake -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_UART_LOG=ON -DENABLE_CART_TRACE=ON -DUART_LOG_BUILD_TAG=my-diag -B build-diag .
-
-# traceq: nodebug speed, tracers only
-cmake -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_UART_LOG=ON -DENABLE_CART_TRACE=ON -DTRACE_QUIET_LOG=ON \
-    -DUART_LOG_BUILD_TAG=my-traceq -B build-traceq .
+    -DENABLE_UART_LOG=ON -DENABLE_CART_TRACE=ON \
+    -DUART_LOG_BUILD_TAG=my-diag -B build-diag .
 ```
 
 For the logging builds, connect a UART adapter to the USB_DP pad (UART1 TX, 115200 8N1) to read the log output.

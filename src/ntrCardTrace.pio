@@ -1,0 +1,36 @@
+; Passive cartridge command listener.
+;
+; Runs on a dedicated PIO0 state machine and only observes CEB/WREB/D0..D7.
+; It never drives a pin, never sets pindirs, never raises a PIO IRQ and never
+; touches the service state machine (PIO0 SM0) or its FIFOs, so it cannot add
+; instructions to the cartridge response deadline path.
+;
+; Framing mirrors the ntr_card service program:
+;   - wait CEB falling edge,
+;   - sample D0..D7 on the WREB rising edge that the service program also uses,
+;   - eight edges make command word 0, eight more make command word 1,
+;   - wait for CEB to rise and start the next transaction.
+;
+; Autopush (32-bit, shift left, threshold 32) emits exactly the two {cmd0,cmd1}
+; FIFO words per command; an IRQ-less DMA channel drains them into the trace
+; ring. If that ring/FIFO backs up, only this listener stalls - the service SM
+; keeps running.
+.program ntr_card_trace
+
+.define PIN_CEB 10
+.define PIN_WREB 11
+
+.wrap_target
+trace_start:
+    wait 1 gpio PIN_CEB
+    wait 0 gpio PIN_CEB
+
+    set x, 7
+trace_cmd_loop:
+    wait 0 gpio PIN_WREB
+    wait 1 gpio PIN_WREB
+    in pins, 8
+    jmp x-- trace_cmd_loop
+
+    wait 1 gpio PIN_CEB
+.wrap
