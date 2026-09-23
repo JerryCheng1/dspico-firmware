@@ -6,6 +6,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#ifdef CACHE_WATCH_LOG
+#include "cacheDiagLog.h"
+#endif
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
 #include "hardware/structs/scb.h"
@@ -44,6 +47,8 @@ extern "C" volatile u32 gCartSdFifoRecovery;
 #endif
 #ifdef CACHE_WATCH_LOG
 #include "hardware/uart.h"
+#include "hardware/exception.h"
+#include "hardware/structs/systick.h"
 #endif
 
 #ifndef CACHE_L2_MODE
@@ -58,36 +63,139 @@ static bool sIsSdCardMounted;
 #ifdef CACHE_WATCH_LOG
 // Core0 writes only these markers; core1 owns the runtime UART in this build.
 // Samples are diagnostic, not atomic storage-completion observations.
-static volatile u32 sWatchPhase, sWatchLoops;
 static volatile bool sWatchReady, sWatchL2;
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
+static volatile u32 sWatchPhase, sWatchLoops;
 static volatile u32 sWatchRecoveries, sWatchRecoverCmd, sWatchRecoverPc;
 static volatile u32 sWatchRecoverRemaining, sWatchRecoverTx;
+#endif
 extern "C" void rp2350_sdio_debug_words(u32 out[4]);
 extern volatile u32 gCartSdE4LenArmed;
 
+// Core1-local interrupt: no timer alarm, shared SDK timer lock, or Core0
+// callback. The periodic interrupt also bounds a tick/check/WFE race to 1 ms.
+static volatile bool sWatchTick;
+static volatile u32 sWatchTicks;
+static void __scratch_x("cpu1") cacheWatchTick(void)
+{
+    sWatchTick = true;
+    sWatchTicks++;
+}
+
+static void cacheWatchClockInit(void)
+{
+    // SDK start_all_ticks() supplies the external SysTick reference at 1 MHz.
+    // Ordinary sleep preserves this wake source; don't use deep/WIC sleep.
+    scb_hw->scr &= ~ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
+    systick_hw->csr = 0;
+    exception_set_exclusive_handler(SYSTICK_EXCEPTION, cacheWatchTick);
+    exception_set_priority(SYSTICK_EXCEPTION, PICO_LOWEST_EXCEPTION_PRIORITY);
+    systick_hw->rvr = CACHE_WATCH_POLL_US - 1u;
+    systick_hw->cvr = 0;
+    systick_hw->csr = M33_SYST_CSR_TICKINT_BITS | M33_SYST_CSR_ENABLE_BITS;
+}
+
 static void cacheWatchPoll(void)
 {
-    static u32 throttle, lastUs;
-    static char line[768];
-    static unsigned len, pos;
+    static u32 lastUs, sample, blockedUs;
+    static bool blockedStream;
+    static cacheTextStream stream;
+    static unsigned part = 5;
+    static cacheSdCounters counters; // avoid adding a snapshot to core1's stack
+    static cacheWatchGate gate;
     // Keep peripheral reads and formatting out of the scrambler's busy path.
-    if ((++throttle & 1023u) || !sWatchReady)
+    if (!sWatchReady)
         return;
-    if (pos < len)
+    u32 now = time_us_32();
+    // No metadata scan or runtime UART during initial cartridge negotiation.
+    if (!cacheWatchGateWarm(&gate, now)) return;
+    const volatile cs_state* cs = cacheSdState();
+    const volatile cacheSdTxSnapshot* tx = cacheSdLastTx();
+    const u32 activity[7] = {gNtrRomEmu.cmd0, gNtrRomEmu.cmd1,
+        (u32)gNtrRomEmu.wordIdx, cs->c_e4_busy, cs->c_e4_ready_queued,
+        tx->sends, cs->write_epoch};
+    bool available = gpio_get(PIN_CEB) && gpio_get(PIN_CS2) &&
+        (!gComputeScrambler || SCR_RING_WRAP(gScramblerRingWPtr + 1) ==
+                               gNtrRomEmu.scrRingRPtr);
+    bool idle = cacheWatchGateIdle(&gate, now, available, activity);
+    bool stalled = cacheWatchGateStalled(&gate, now);
+    if (!idle && stalled)
     {
-        for (unsigned n = 0; n < 16 && pos < len; n++)
+        // Post-stall summary only: no E4/E5 progress for five seconds, and
+        // this function is only called when the producer has no work.
+        // Do not require CS high: that is exactly the gate being diagnosed.
+        if (!blockedStream)
         {
-            if (!uart_is_writable(uart1))
-                break;
-            uart_putc_raw(uart1, line[pos++]);
+            if ((u32)(now - blockedUs) < CACHE_WATCH_STALLED_US) return;
+            blockedUs = now;
+            blockedStream = true;
+            part = 5; // abandon any paused full group, start a delimited line
+            unsigned n = 0;
+            stream.values[n++] = now;
+            stream.values[n++] = sWatchTicks;
+            stream.values[n++] = gpio_get(PIN_CEB);
+            stream.values[n++] = gpio_get(PIN_CS2);
+            stream.values[n++] = gComputeScrambler;
+            stream.values[n++] = (u32)gScramblerRingWPtr;
+            stream.values[n++] = (u32)gNtrRomEmu.scrRingRPtr;
+            stream.values[n++] = pio_sm_get_pc(pio0, 0) - sProgramOffset;
+            stream.values[n++] = gNtrRomEmu.cmd0;
+            stream.values[n++] = gNtrRomEmu.wordIdx;
+            stream.values[n++] = gCacheSdReadReady;
+            stream.values[n++] = cs->c_e4_busy;
+            stream.values[n++] = cs->c_e4_ready_queued;
+            stream.values[n++] = cs->c_e5_ok;
+            cacheTextStart(&stream,
+                "\n[watch-blocked] v=4 us=%u ticks=%u ceb=%u cs2=%u scramble=%u w=%08X r=%08X rel=%u cmd=%08X wi=%u ready=%u e4=%u/%u e5=%u\n", n);
+        }
+        for (unsigned n = 0; n < 16; n++)
+        {
+            if ((gComputeScrambler && SCR_RING_WRAP(gScramblerRingWPtr + 1) !=
+                 gNtrRomEmu.scrRingRPtr) || !uart_is_writable(uart1)) return;
+            int ch = cacheTextNext(&stream);
+            if (ch < 0) { blockedStream = false; break; }
+            uart_putc_raw(uart1, (char)ch);
         }
         return;
     }
-    u32 now = time_us_32();
+    if (blockedStream)
+    {
+        // New host activity cancels this post-stall record, not the producer.
+        stream.format = nullptr;
+        blockedStream = false;
+        part = 5;
+    }
+    if (!idle) return;
+    // Formatting and draining are both incremental. Return to the producer
+    // whenever the scrambler needs words or either cartridge bus becomes active.
+    if (!gpio_get(PIN_CEB) || !gpio_get(PIN_CS2) ||
+        (gComputeScrambler && SCR_RING_WRAP(gScramblerRingWPtr + 1) !=
+                              gNtrRomEmu.scrRingRPtr)) return;
+    if (stream.format)
+    {
+        for (unsigned n = 0; n < 16; n++)
+        {
+            if (!gpio_get(PIN_CEB) || !gpio_get(PIN_CS2) ||
+                (gComputeScrambler && SCR_RING_WRAP(gScramblerRingWPtr + 1) !=
+                                      gNtrRomEmu.scrRingRPtr) ||
+                !uart_is_writable(uart1))
+                return;
+            int ch = cacheTextNext(&stream);
+            if (ch < 0) break;
+            uart_putc_raw(uart1, (char)ch);
+        }
+        return;
+    }
+    if (part < 4)
+    {
+        cacheDiagStartLine(&stream, part++, sample, &counters);
+        return;
+    }
     if (now - lastUs < 1000000u)
         return;
     lastUs = now;
-    const volatile cs_state* cs = cacheSdState();
+    sample++;
+    cacheSdGetCounters(&counters);
     u32 flags = (cs->intent_valid ? 1u : 0u) |
                 (cs->intent_consumed ? 2u : 0u) |
                 (cs->completion_valid ? 4u : 0u) |
@@ -96,41 +204,95 @@ static void cacheWatchPoll(void)
                 (cs->intent_faulted ? 32u : 0u);
     u32 sd[4];
     rp2350_sdio_debug_words(sd);
-    const volatile cacheSdTxSnapshot* tx = cacheSdLastTx();
-    int n = snprintf(line, sizeof(line),
-        "[watch] loop=%lu phase=%lu l2=%u sd=%d sec=%08lX done=%lu/%lu ceb=%u cs2=%u pc=%lu rel=%lu\n"
+    unsigned field = 0;
+    stream.values[field++] = (uint32_t)(sample);
+    stream.values[field++] = (uint32_t)(now);
+    stream.values[field++] = (uint32_t)(sWatchTicks);
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
+    stream.values[field++] = (uint32_t)(sWatchLoops);
+    stream.values[field++] = (uint32_t)(sWatchPhase);
+#endif
+    stream.values[field++] = (uint32_t)(sWatchL2);
+    stream.values[field++] = (uint32_t)(gSdCard.DebugState());
+    stream.values[field++] = (uint32_t)(gSdCard.DebugSectorAddress());
+    stream.values[field++] = (uint32_t)(gSdCard.GetSectorsCompleted());
+    stream.values[field++] = (uint32_t)(gSdCard.GetSectorCount());
+    stream.values[field++] = (uint32_t)(gpio_get(PIN_CEB));
+    stream.values[field++] = (uint32_t)(gpio_get(PIN_CS2));
+    stream.values[field++] = (uint32_t)(pio_sm_get_pc(pio0, 0));
+    stream.values[field++] = (uint32_t)(pio_sm_get_pc(pio0, 0) - sProgramOffset);
+    stream.values[field++] = (uint32_t)(cs->intent.sector);
+    stream.values[field++] = (uint32_t)(flags);
+    stream.values[field++] = (uint32_t)(gCacheSdReadReady);
+    stream.values[field++] = (uint32_t)(cs->c_protocol_fault);
+    stream.values[field++] = (uint32_t)(cs->c_sd_retry);
+    stream.values[field++] = (uint32_t)(cs->c_sd_fault);
+    stream.values[field++] = (uint32_t)(cacheSdErrors());
+    stream.values[field++] = (uint32_t)(sd[0]);
+    stream.values[field++] = (uint32_t)(sd[1]);
+    stream.values[field++] = (uint32_t)(sd[2]);
+    stream.values[field++] = (uint32_t)(sd[3]);
+    stream.values[field++] = (uint32_t)(dma_channel_is_busy(2));
+    stream.values[field++] = (uint32_t)(dma_channel_is_busy(3));
+    stream.values[field++] = (uint32_t)(gNtrRomEmu.cmd0);
+    stream.values[field++] = (uint32_t)(gNtrRomEmu.wordIdx);
+    stream.values[field++] = (uint32_t)(gCartSdE4LenArmed);
+    stream.values[field++] = (uint32_t)(cacheSdOfferId());
+    stream.values[field++] = (uint32_t)(cacheSdAckedOfferId());
+    stream.values[field++] = (uint32_t)(cs->c_e4_busy);
+    stream.values[field++] = (uint32_t)(cs->c_e4_ready_queued);
+    stream.values[field++] = (uint32_t)(cs->c_e4_ack_failed);
+    stream.values[field++] = (uint32_t)(cs->c_e5_ok);
+    stream.values[field++] = (uint32_t)(cs->c_e5_no_ack);
+    stream.values[field++] = (uint32_t)(cs->first_fault.kind);
+    stream.values[field++] = (uint32_t)(cs->first_fault.seq);
+    stream.values[field++] = (uint32_t)(cs->first_fault.sampled_ready);
+    stream.values[field++] = (uint32_t)(cacheSdFills());
+    stream.values[field++] = (uint32_t)(cacheSdHits());
+    stream.values[field++] = (uint32_t)(gCartSdFifoRecovery);
+    stream.values[field++] = (uint32_t)(gCartSdRecoveryPending);
+    stream.values[field++] = (uint32_t)(tx->sends);
+    stream.values[field++] = (uint32_t)(tx->sector);
+    stream.values[field++] = (uint32_t)(tx->offer);
+    stream.values[field++] = (uint32_t)(tx->head);
+    stream.values[field++] = (uint32_t)(tx->tail);
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
+    stream.values[field++] = (uint32_t)(sWatchRecoveries);
+    stream.values[field++] = (uint32_t)(sWatchRecoverCmd);
+    stream.values[field++] = (uint32_t)(sWatchRecoverPc);
+    stream.values[field++] = (uint32_t)(sWatchRecoverRemaining);
+    stream.values[field++] = (uint32_t)(sWatchRecoverTx);
+#endif
+    cacheTextStart(&stream,
+        "\n[watch] v=4 q=%lu us=%lu ticks=%lu "
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
+        "marks=1 loop=%lu phase=%lu "
+#else
+        "marks=0 "
+#endif
+        "l2=%u sd=%d sec=%08lX done=%lu/%lu ceb=%u cs2=%u pc=%lu rel=%lu\n"
         "[watch] req=%08lX flags=%02lX ready=%lu proto=%lu retry=%lu fault=%lu err=%lu io=%lu/%lu/%lu/%lu dma=%u%u cmd=%08lX wi=%lu e4=%lu\n"
         "[watch] offer=%lu ack=%lu e4=%lu/%lu/%lu e5=%lu/%lu first=%u seq=%lu sampled=%lu fill=%lu hitTry=%lu fifo=%lu pending=%lu\n"
-        "[tx] n=%lu sec=%08lX offer=%lu head=%08lX tail=%08lX kicks=%lu lastCmd=%08lX rel=%lu remain=%lu txfifo=%lu\n",
-        (unsigned long)sWatchLoops, (unsigned long)sWatchPhase, (unsigned)sWatchL2,
-        gSdCard.DebugState(), (unsigned long)gSdCard.DebugSectorAddress(),
-        (unsigned long)gSdCard.GetSectorsCompleted(), (unsigned long)gSdCard.GetSectorCount(),
-        (unsigned)gpio_get(PIN_CEB), (unsigned)gpio_get(PIN_CS2),
-        (unsigned long)pio_sm_get_pc(pio0, 0),
-        (unsigned long)(pio_sm_get_pc(pio0, 0) - sProgramOffset),
-        (unsigned long)cs->intent.sector, (unsigned long)flags,
-        (unsigned long)gCacheSdReadReady,
-        (unsigned long)cs->c_protocol_fault, (unsigned long)cs->c_sd_retry,
-        (unsigned long)cs->c_sd_fault, (unsigned long)cacheSdErrors(),
-        (unsigned long)sd[0], (unsigned long)sd[1], (unsigned long)sd[2], (unsigned long)sd[3],
-        (unsigned)dma_channel_is_busy(2), (unsigned)dma_channel_is_busy(3),
-        (unsigned long)gNtrRomEmu.cmd0, (unsigned long)gNtrRomEmu.wordIdx,
-        (unsigned long)gCartSdE4LenArmed,
-        (unsigned long)cacheSdOfferId(), (unsigned long)cacheSdAckedOfferId(),
-        (unsigned long)cs->c_e4_busy, (unsigned long)cs->c_e4_ready_queued,
-        (unsigned long)cs->c_e4_ack_failed, (unsigned long)cs->c_e5_ok,
-        (unsigned long)cs->c_e5_no_ack, (unsigned)cs->first_fault.kind,
-        (unsigned long)cs->first_fault.seq, (unsigned long)cs->first_fault.sampled_ready,
-        (unsigned long)cacheSdFills(), (unsigned long)cacheSdHits(),
-        (unsigned long)gCartSdFifoRecovery, (unsigned long)gCartSdRecoveryPending,
-        (unsigned long)tx->sends, (unsigned long)tx->sector, (unsigned long)tx->offer,
-        (unsigned long)tx->head, (unsigned long)tx->tail,
-        (unsigned long)sWatchRecoveries, (unsigned long)sWatchRecoverCmd,
-        (unsigned long)sWatchRecoverPc, (unsigned long)sWatchRecoverRemaining,
-        (unsigned long)sWatchRecoverTx);
-    len = n > 0 ? ((unsigned)n < sizeof(line) ? (unsigned)n : sizeof(line) - 1) : 0;
-    pos = 0;
+        "[tx] n=%lu sec=%08lX offer=%lu head=%08lX tail=%08lX"
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
+        " kicks=%lu lastCmd=%08lX rel=%lu remain=%lu txfifo=%lu"
+#endif
+        "\n", field);
+    part = 0;
 }
+
+static void __scratch_x("cpu1") cacheWatchIdle(void)
+{
+    if (sWatchTick)
+    {
+        sWatchTick = false;
+        cacheWatchPoll();
+    }
+    // Also wakes immediately on the existing scrambler-consumer SEV.
+    __wfe();
+}
+#endif
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
 #define WATCH_PHASE(p) (sWatchPhase = (p))
 #else
 #define WATCH_PHASE(p) ((void)0)
@@ -241,7 +403,7 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
                 irq_set_enabled(PIO0_IRQ_0, true);
                 return;
             }
-#ifdef CACHE_WATCH_LOG
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
             sWatchRecoverCmd = gNtrRomEmu.cmd0;
             sWatchRecoverPc = pio_sm_get_pc(pio0, 0) - sProgramOffset;
             sWatchRecoverRemaining = dma_hw->ch[0].transfer_count;
@@ -298,7 +460,11 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
 void __scratch_x("cpu1") core1_entry(void)
 {
     irq_set_mask_enabled(~0u, false);
+#ifdef CACHE_WATCH_LOG
+    cacheWatchClockInit();
+#else
     scb_hw->scr |= ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
+#endif
     while (!gComputeScrambler)
     {
         gScramblerRingWPtr = gScramblerRing;
@@ -308,7 +474,7 @@ void __scratch_x("cpu1") core1_entry(void)
         // service SM, DMA0 or the SDIO state machine.
         ntrCardTraceCore1Poll();
 #elif defined(CACHE_WATCH_LOG)
-        cacheWatchPoll();
+        cacheWatchIdle();
 #else
         __wfe();
 #endif
@@ -320,7 +486,7 @@ void __scratch_x("cpu1") core1_entry(void)
         if (next == gNtrRomEmu.scrRingRPtr)
         {
 #ifdef CACHE_WATCH_LOG
-            cacheWatchPoll();
+            cacheWatchIdle();
 #else
             __wfe();
 #endif
@@ -712,7 +878,7 @@ int __time_critical_func(main)()
 #endif
     while (1)
     {
-#ifdef CACHE_WATCH_LOG
+#ifdef CACHE_WATCH_ACTIVE_MARKERS
         sWatchLoops++;
 #endif
         WATCH_PHASE(1);

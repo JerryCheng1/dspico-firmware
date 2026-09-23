@@ -70,7 +70,8 @@ set(L2_DIAG_MODE "M5" CACHE STRING "L2 diagnostic mode M0..M5 (design section 10
 # compared with ONE variable changed. Must stay OFF and must never become the
 # default after acceptance.
 option(L2_LEGACY_PUBLISH_FILL "Contrast build: old publish-then-fill behaviour (M3 only)" OFF)
-option(CACHE_WATCH_LOG "Core1 hang diagnostics, independent of the core0 loop and bus idle" OFF)
+option(CACHE_WATCH_LOG "Core1 WFE/SysTick cache diagnostics with idle gating" OFF)
+option(CACHE_WATCH_ACTIVE_MARKERS "Intrusive core0 phase/gate/recovery markers (diagnostic experiments only)" OFF)
 set(CACHE_BUILD_GIT_REV "" CACHE STRING "Git revision embedded in the cache boot banner")
 
 if(CACHE_STAGE LESS 0 OR CACHE_STAGE GREATER 10)
@@ -91,6 +92,9 @@ if(CACHE_INIT_LOG AND CACHE_STAGE LESS 1)
 endif()
 if(CACHE_STATS_LOG AND NOT CACHE_INIT_LOG)
   message(FATAL_ERROR "CACHE_STATS_LOG requires CACHE_INIT_LOG=ON")
+endif()
+if(CACHE_WATCH_ACTIVE_MARKERS AND NOT CACHE_WATCH_LOG)
+  message(FATAL_ERROR "CACHE_WATCH_ACTIVE_MARKERS requires CACHE_WATCH_LOG")
 endif()
 if(CACHE_WATCH_LOG)
   if(CACHE_STAGE LESS 3 OR NOT ENABLE_UART_LOG)
@@ -182,6 +186,11 @@ if(CACHE_STATS_LOG)
 endif()
 if(CACHE_WATCH_LOG)
   target_compile_definitions(DSpico PRIVATE CACHE_WATCH_LOG=1)
+  target_sources(DSpico PRIVATE src/cacheDiagLog.c)
+  target_link_libraries(DSpico hardware_exception)
+  if(CACHE_WATCH_ACTIVE_MARKERS)
+    target_compile_definitions(DSpico PRIVATE CACHE_WATCH_ACTIVE_MARKERS=1)
+  endif()
 endif()
 if(CACHE_STAGE GREATER_EQUAL 3)
   if(CACHE_L2_DISABLED)
@@ -273,6 +282,16 @@ if(PSRAM_QUAL_FIRMWARE)
   pico_add_extra_outputs(PsramQual)
   target_link_libraries(PsramQual pico_stdlib hardware_pio hardware_dma)
 endif()
+
+# DSpico is the flash image. Keep host tests, design documents, and the
+# separate PSRAM qualification entry point out of its source list.
+get_target_property(_dspico_sources DSpico SOURCES)
+foreach(_dspico_source IN LISTS _dspico_sources)
+  if(_dspico_source MATCHES "(^|/)(docs|tests)/" OR
+     _dspico_source MATCHES "(^|/)psramQualMain\\.c$")
+    message(FATAL_ERROR "Non-firmware source in DSpico: ${_dspico_source}")
+  endif()
+endforeach()
 
 pico_enable_stdio_uart(DSpico 0)
 pico_add_extra_outputs(DSpico)

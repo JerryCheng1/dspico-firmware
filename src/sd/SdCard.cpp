@@ -261,7 +261,8 @@ bool SdCard::TryInitialize()
 
     irq_set_exclusive_handler(TIMER0_IRQ_0, []
     {
-        hw_clear_bits(&timer0_hw->intr, TIMER_INTR_ALARM_0_BITS);
+        // INTR is write-one-to-clear, not a normal read/write register.
+        timer0_hw->intr = TIMER_INTR_ALARM_0_BITS;
         gSdCard.NotifySequentialReadAlarm();
     });
 
@@ -608,23 +609,25 @@ void SdCard::StopSequentialReadWrite()
 
 void SdCard::StartSequentialReadAlarm()
 {
+    StopSequentialReadAlarm(); // disarm and clear our old source before rearming
     _stopSequentialRead = false;
-    irq_set_enabled(TIMER0_IRQ_0, false);
+    // TIMER0 is also the SDK timebase. Keep it clocked in both power states;
+    // owning alarm 0 does not give this driver ownership of the whole timer.
     hw_set_bits(&clocks_hw->sleep_en1, CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS);
     hw_set_bits(&clocks_hw->wake_en1, CLOCKS_WAKE_EN1_CLK_SYS_TIMER0_BITS);
-    hw_set_bits(&timer0_hw->armed, 1);
-    hw_clear_bits(&timer0_hw->intr, TIMER_INTR_ALARM_0_BITS);
+    u32 target = timer0_hw->timerawl + SEQUENTIAL_READ_TIMEOUT_MICROSECONDS;
+    timer0_hw->alarm[0] = target;
     hw_set_bits(&timer0_hw->inte, TIMER_INTE_ALARM_0_BITS);
     irq_set_enabled(TIMER0_IRQ_0, true);
-    u64 target = timer0_hw->timerawl + SEQUENTIAL_READ_TIMEOUT_MICROSECONDS;
-    timer0_hw->alarm[0] = (u32)target;
 }
 
 void SdCard::StopSequentialReadAlarm()
 {
     irq_set_enabled(TIMER0_IRQ_0, false);
-    hw_clear_bits(&clocks_hw->sleep_en1, CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS);
-    hw_clear_bits(&clocks_hw->wake_en1, CLOCKS_WAKE_EN1_CLK_SYS_TIMER0_BITS);
+    hw_clear_bits(&timer0_hw->inte, TIMER_INTE_ALARM_0_BITS);
+    timer0_hw->armed = 1u << 0; // ARMED is also write-one-to-clear
+    timer0_hw->intr = TIMER_INTR_ALARM_0_BITS;
+    irq_clear(TIMER0_IRQ_0);
 }
 
 u32 SdCard::CalculateSdCapacity() const

@@ -139,6 +139,11 @@ static volatile uint32_t sSdTokenObsolete, sSdTokenLiveConflict, sSdTransferErro
 static volatile uint32_t sL2HitAttempt, sL2HitVerified, sL2CrcFail;
 static volatile uint32_t sPsramReadFail, sPsramFillFail;
 static volatile uint32_t sFillAdmit, sFillDrop, sFillDefer, sFillCommit, sFillQuarantine;
+static volatile uint32_t sDemandHitOk, sProbeTry, sProbeOk, sReadBytes, sWriteBytes;
+#if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
+static volatile uint32_t sGateChecks, sGateBlocked, sGateMask;
+static uint32_t sGatePhase;
+#endif
 volatile uint32_t gCacheSdReadReady;
 // Published only by E4 after full identity/slot validation. All revocations
 // run on core0, serialized by the cartridge IRQ priority / main-loop mask.
@@ -257,6 +262,7 @@ CACHE_RAM_CODE void cacheSdInit(void)
     sFillState = FILL_NONE;
     sFillIsProbe = 0;
     sFillDropReason = FILL_DROP_NONE;
+    sFillSector = sFillOff = sFillSnapshotId = 0;
     sDidPublish = 0;
     sDmaValid = 0;
     sDegraded = 0;
@@ -268,6 +274,11 @@ CACHE_RAM_CODE void cacheSdInit(void)
     sL2HitAttempt = sL2HitVerified = sL2CrcFail = 0;
     sPsramReadFail = sPsramFillFail = 0;
     sFillAdmit = sFillDrop = sFillDefer = sFillCommit = sFillQuarantine = 0;
+    sDemandHitOk = sProbeTry = sProbeOk = sReadBytes = sWriteBytes = 0;
+#if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
+    sGateChecks = sGateBlocked = sGateMask = 0;
+    sGatePhase = 0;
+#endif
     sEnabled = false;
 }
 
@@ -648,7 +659,10 @@ static CACHE_RAM_CODE void publishVerified(void)
             sFillState = FILL_SNAPSHOT_READY;
             sFillIsProbe = wantProbe ? 1 : 0;
             if (wantProbe)
+            {
                 sL2HitAttempt++;
+                sProbeTry++;
+            }
         }
         else if (want)
         {
@@ -766,6 +780,7 @@ static CACHE_RAM_CODE void jobStep(void)
         return;
     }
 
+    sReadBytes += frag;
     sJobCrc = crc32Update(sJobCrc, dst, frag);
     sJobOff += frag;
 
@@ -780,6 +795,7 @@ static CACHE_RAM_CODE void jobStep(void)
     if (ok)
     {
         sL2HitVerified++;
+        sDemandHitOk++;
         publishVerified();
         return;
     }
@@ -823,6 +839,7 @@ static CACHE_RAM_CODE void probeStep(void)
         return;
     }
 
+    sReadBytes += frag;
     bool match = memcmp(sProbeChunk, &sFillStage[sFillOff], frag) == 0;
     sFillOff += frag;
     bool complete = (sFillOff >= CS_SECTOR_BYTES);
@@ -838,6 +855,7 @@ static CACHE_RAM_CODE void probeStep(void)
     if (match && epochOk)
     {
         sL2HitVerified++;
+        sProbeOk++;
     }
     else if (match)
     {
@@ -891,6 +909,7 @@ static CACHE_RAM_CODE void fillStep(void)
         return;
     }
 
+    sWriteBytes += frag;
     sFillCrc = crc32Update(sFillCrc, &sFillStage[sFillOff], frag);
     sFillOff += frag;
 
@@ -934,6 +953,18 @@ static CACHE_RAM_CODE void fillStep(void)
 // never be admitted; drop it (design section 7.3). Runs on the main loop.
 static CACHE_RAM_CODE void fillReconcile(void)
 {
+    // An admitted snapshot can remain blocked across writes/media changes.
+    // Retire its stale namespace before considering it for transport again;
+    // otherwise it monopolizes the single snapshot buffer indefinitely.
+    if ((sFillState == FILL_SNAPSHOT_READY || sFillState == FILL_ADMITTED ||
+         sFillState == FILL_TRANSFERRING) &&
+        (sFillEpoch != sCacheEpoch || sFillMediaEpoch != sCs.media_epoch ||
+         sFillWriteEpoch != sCs.write_epoch))
+    {
+        fillAbortReason(FILL_DROP_EPOCH);
+        sFillDrop++;
+        return;
+    }
     if (sFillState != FILL_SNAPSHOT_READY)
         return;
     const cs_slot* sl = &sCs.slots[sFillWaitSlot];
@@ -1000,6 +1031,31 @@ CACHE_RAM_CODE cacheSdStepResult cacheSdStep(void)
     bool foreground = sCs.intent_valid || sCs.completion_valid ||
                       sCs.binding_valid || sCs.write_pending ||
                       sHw->dma0Busy() || !sHw->cartIdle();
+#if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
+    // Observe the existing gate, without extra hardware calls or changing its
+    // decision. Sample one in 1024 eligible steps, not millions of SRAM
+    // read/modify/writes per second. Mask describes the last sampled step.
+    if (sFillState != FILL_ADMITTED && sFillState != FILL_TRANSFERRING)
+    {
+        sGateMask = sGatePhase = 0;
+    }
+    else if ((sGatePhase++ & 1023u) == 0)
+    {
+        uint32_t mask = (sCs.intent_valid ? CACHE_GATE_INTENT : 0u) |
+                        (sCs.completion_valid ? CACHE_GATE_COMPLETION : 0u) |
+                        (sCs.binding_valid ? CACHE_GATE_BINDING : 0u) |
+                        (sCs.write_pending ? CACHE_GATE_WRITE : 0u);
+        if (foreground && !mask) mask |= CACHE_GATE_BUS;
+        if (sJobActive) mask |= CACHE_GATE_JOB;
+        if (sDidPublish) mask |= CACHE_GATE_PUBLISH;
+        if (overBudget) mask |= CACHE_GATE_BUDGET;
+        sGateMask = mask;
+        sGateChecks++;
+        if ((!FILL_LEGACY_PUBLISH && (sDidPublish || foreground)) ||
+            sJobActive || overBudget)
+            sGateBlocked++;
+    }
+#endif
     if ((!sDidPublish || FILL_LEGACY_PUBLISH) && !sJobActive &&
         (!foreground || FILL_LEGACY_PUBLISH) && !overBudget &&
         (sFillState == FILL_ADMITTED || sFillState == FILL_TRANSFERRING))
@@ -1063,6 +1119,38 @@ CACHE_RAM_CODE void cacheSdGetCounters(cacheSdCounters* out)
     out->fill_commit = sFillCommit;
     out->fill_quarantine = sFillQuarantine;
     out->fill_drop_reason = sFillDropReason;
+    out->mode = sL2Mode;
+    out->enabled = sEnabled;
+    out->degraded = sDegraded;
+    out->epoch = sCacheEpoch;
+    out->sd_miss = sMisses;
+    out->demand_hit_try = sHits;
+    out->demand_hit_ok = sDemandHitOk;
+    out->probe_try = sProbeTry;
+    out->probe_ok = sProbeOk;
+    out->read_bytes = sReadBytes;
+    out->write_bytes = sWriteBytes;
+    out->fill_state = sFillState;
+    out->fill_sector = sFillSector;
+    out->fill_offset = sFillOff;
+    out->snapshot = sFillSnapshotId;
+#if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
+    out->gate_measured = 1;
+    out->gate_checks = sGateChecks;
+    out->gate_blocked = sGateBlocked;
+    out->gate_mask = sGateMask;
+#else
+    out->gate_measured = 0;
+    out->gate_checks = out->gate_blocked = out->gate_mask = 0;
+    // Read-only observer: no per-step writes or extra hardware callbacks.
+    // Does not report DMA/bus/budget or the actual last admission decision.
+    if (sFillState == FILL_ADMITTED || sFillState == FILL_TRANSFERRING)
+        out->gate_mask = (sCs.intent_valid ? CACHE_GATE_INTENT : 0u) |
+                        (sCs.completion_valid ? CACHE_GATE_COMPLETION : 0u) |
+                        (sCs.binding_valid ? CACHE_GATE_BINDING : 0u) |
+                        (sCs.write_pending ? CACHE_GATE_WRITE : 0u) |
+                        (sJobActive ? CACHE_GATE_JOB : 0u);
+#endif
 }
 
 CACHE_RAM_CODE uint32_t cacheSdSectors(void)

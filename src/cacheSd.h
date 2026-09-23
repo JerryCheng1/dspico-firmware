@@ -82,7 +82,21 @@ typedef struct
     uint32_t fill_commit;
     uint32_t fill_quarantine;
     uint32_t fill_drop_reason;   // last drop reason (CS_FILL_DROP_*)
+    // Runtime diagnostics: approximate cross-core samples, not a transaction.
+    uint32_t mode, enabled, degraded, epoch, sd_miss;
+    uint32_t demand_hit_try, demand_hit_ok, probe_try, probe_ok;
+    uint32_t read_bytes, write_bytes; // successful transport fragments, cumulative
+    uint32_t fill_state, fill_sector, fill_offset, snapshot;
+    uint32_t gate_checks, gate_blocked, gate_mask; // WATCH/HOST; 1/1024 steps sampled
+    uint32_t gate_measured; // 0: only a software-state observation; counts unavailable
 } cacheSdCounters;
+
+enum {
+    CACHE_GATE_INTENT = 1u, CACHE_GATE_COMPLETION = 2u,
+    CACHE_GATE_BINDING = 4u, CACHE_GATE_WRITE = 8u,
+    CACHE_GATE_BUS = 16u, // DMA0/bus busy when software foreground did not short-circuit
+    CACHE_GATE_JOB = 32u, CACHE_GATE_PUBLISH = 64u, CACHE_GATE_BUDGET = 128u
+};
 
 // A read-only summary of the last buffer submitted to DMA0 (not wire proof).
 typedef struct { uint32_t sends, sector, head, tail, offer; } cacheSdTxSnapshot;
