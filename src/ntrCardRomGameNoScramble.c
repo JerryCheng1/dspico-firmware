@@ -9,19 +9,18 @@
 // word sits in the TX FIFO. pio_sm_clear_fifos below drops that word, so the
 // flag must go with it.
 extern volatile u32 gCartSdE4LenArmed;
+extern volatile u32 gCartSdRecoveryPending;
+extern volatile u32 gCartSdFifoRecovery;
 
 void ntrc_gameNoScrambleCmd1Unknown(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
 {
-    // Upstream disabled PIO0_IRQ_0 here ("do not receive further commands
-    // until card reset") and blocking-printed - a transient desync (a lost
-    // transaction leaving a partial RX stream, r66 boot 3: D=1 -> U=1) then
-    // killed the cart PERMANENTLY: every later command stalled the SM on the
-    // length autopull (final state PC=8, RXF=2, loader "failed to open pico
-    // loader file"). Instead: drop whatever half-command is left in the FIFOs
-    // and re-align the dispatcher; the CEB-rise recovery in gpioIrq kicks the
-    // SM if it is not parked. The console retries the transaction.
-    pio_sm_clear_fifos(pio, 0);
-    gCartSdE4LenArmed = 0;
+    // Unknown framing is a whole-transaction failure. Never clear RX while
+    // the SM can still capture command bytes; CEB-high recovery owns reset.
+    (void)word;
+    (void)pio;
+    if (!gCartSdRecoveryPending)
+        gCartSdFifoRecovery++;
+    gCartSdRecoveryPending = 1;
     romEmu->wordIdx = 0;
 }
 

@@ -455,47 +455,17 @@ void SdCard::StateReadBusy()
         case SDIO_BLOCK_NOT_READY:
         default:
         {
+#if CACHE_STAGE >= 3
+            // The DMA completion IRQ may have run after the poll sampled
+            // NOT_READY but before this point. WFI would then wait for an
+            // unrelated IRQ and prevent even the software timeout recheck.
+            // Keep polling until an atomic wait/wakeup protocol exists.
+            tight_loop_contents();
+#else
             __wfi();
+#endif
             break;
         }
-    }
-}
-
-bool __time_critical_func(SdCard::KickPendingReadFromCartridgeIrq)()
-{
-    if (_state != State::ReadBegin)
-        return false;
-
-    // This performs only setup plus one CMD18 attempt (or RX-continue for the
-    // already-open sequential stream). Sector payload reception remains DMA
-    // driven and is completed by Update()/the bounded E4 poll.
-    StateReadBegin(true);
-    return _state == State::ReadBusy;
-}
-
-void __time_critical_func(SdCard::PollReadCompletionFromCartridgeIrq)()
-{
-    // PIO0_IRQ_0 has higher priority than DMA_IRQ_1. During the loader's
-    // short E4 polling burst, DMA can therefore have written the complete
-    // sector while the lower-priority IRQ/core0 state machine has not yet
-    // published it. Poll the DMA descriptor cursor directly, but handle only
-    // successful progress here: all retry/abort/command paths stay in Update()
-    // where they are allowed to wait.
-    if (_state != State::ReadBusy || _cancelRequested)
-        return;
-
-    const auto blockStatus = rp2350_sdio_rx_poll_one_block_from_irq();
-    if (blockStatus == SDIO_BLOCK_OK)
-    {
-        _sectorsCompleted++;
-    }
-    else if (blockStatus == SDIO_BLOCK_ALL_DONE)
-    {
-        _sectorsCompleted = _sectorCount;
-        _nextSequentialSector = _sectorAddress + _sectorsCompleted;
-        _sequentialState = SequentialState::SequentialRead;
-        StartSequentialReadAlarm();
-        _state = State::Idle;
     }
 }
 

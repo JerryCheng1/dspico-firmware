@@ -20,6 +20,12 @@ public:
     /// @return \c true if the SD card is ready, or \c false otherwise.
     bool IsReady() const { return _state == State::Idle; }
 
+    /// @brief Monotonic token identifying the most recently started SD
+    ///        transfer. A consumer that started a read can detect that another
+    ///        owner started a new transfer (token changed) even after the card
+    ///        returned to Idle.
+    u32 GetTransferId() const { return _transferId; }
+
     /// @brief Returns if the SD card is currently writing.
     /// @return \c true if the SD card is writing, or \c false otherwise.
     bool IsWriting() const { return _state == State::WriteBegin || _state == State::WriteBusy; }
@@ -41,6 +47,7 @@ public:
         _sectorCount = count;
         _sectorsCompleted = 0;
         _cancelRequested = false;
+        _transferId++;
         _state = State::ReadBegin;
         return true;
     }
@@ -81,6 +88,7 @@ public:
         _sectorCount = count;
         _sectorsCompleted = count;
         _cancelRequested = false;
+        _transferId++;
         _state = State::Idle;
         return true;
 #else
@@ -90,6 +98,7 @@ public:
         _sectorsCompleted = 0;
         _cancelRequested = false;
         _keepSequentialWriteOpen = keepSequentialWriteOpen;
+        _transferId++;
         _state = State::WriteBegin;
         return true;
 #endif
@@ -106,18 +115,6 @@ public:
 
     /// @brief Updates the SD state machine.
     void Update();
-
-    /// @brief Performs one bounded, non-blocking read-completion poll from the
-    ///        cartridge IRQ. This never starts/retries/stops a transaction and
-    ///        never waits; it only makes an already DMA-complete read visible
-    ///        before the loader's current E4 status response is returned.
-    void PollReadCompletionFromCartridgeIrq();
-
-    /// @brief Starts a queued read from the E3/E5 cartridge IRQ before the
-    ///        loader can begin its high-priority E4 polling burst. The SD data
-    ///        transfer remains asynchronous; this call never waits for data.
-    /// @return true when the queued request reached ReadBusy.
-    bool KickPendingReadFromCartridgeIrq();
 
     /// @brief Returns the number of sectors that have been completed in the current read or write.
     /// @return The number of sectors that have been completed in the current read or write.
@@ -166,6 +163,40 @@ public:
         return success;
     }
 
+    /// @brief Blocking read that advances the engine while another transfer
+    ///        (for example a cache demand read) still owns it. Unlike a bare
+    ///        <c>while (!TryReadSectorsSync(...))</c> this cannot self-lock:
+    ///        the pending transaction is driven to completion by Update()
+    ///        before the new one is started (design section 8.3 / R6).
+    /// @return Always \c true.
+    bool ReadSectorsBlocking(u8* dst, u32 sector, u32 count)
+    {
+        while (true)
+        {
+            if (TryBeginReadSectors(dst, sector, count))
+            {
+                Update();
+                return true;
+            }
+            Update();
+        }
+    }
+
+    /// @brief Blocking write counterpart of ReadSectorsBlocking().
+    /// @return Always \c true.
+    bool WriteSectorsBlocking(const u8* src, u32 sector, u32 count)
+    {
+        while (true)
+        {
+            if (TryBeginWriteSectors(src, sector, count, false))
+            {
+                Update();
+                return true;
+            }
+            Update();
+        }
+    }
+
 private:
     enum class State
     {
@@ -206,6 +237,7 @@ private:
     volatile bool _stopSequentialRead = false;
     
     volatile bool _cancelRequested = false;
+    volatile u32 _transferId = 0;
 
     sdio_status_t Cmd0GoIdleState() const;
     sdio_status_t Cmd2AllSendCid(cid_t& cid) const;

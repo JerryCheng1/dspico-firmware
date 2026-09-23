@@ -1,0 +1,77 @@
+; APS6404L PSRAM transaction engine (RP2354A board wiring).
+;
+; Pin roles (design section 2.5.1 / 4.1):
+;   OUT/IN/SET base : GPIO22..25  (SIO0..SIO3, four shared data lines)
+;   side-set        : GPIO0       (SCLK, driven only by this SM)
+;   CE0..CE3        : GPIO26..29  (CPU/SIO owned, held high when idle)
+;
+; The engine speaks the 1-4-4 profile from design section 2.6: an 8-bit
+; serial (SPI) command on SIO0, a 24-bit quad address (6 clocks), then either
+; 6 dummy clocks followed by quad read data, or immediate quad write data.
+; The command and 24-bit address are presented as a single 32-bit word
+; ((cmd << 24) | addr). While the command is shifted out one bit at a time
+; only SIO0 is driven, so SIO1..3 keep the high level the CPU preloaded.
+;
+; The side-set is mandatory (not "opt"), so every instruction explicitly
+; defines the SCLK level and no instruction can leave it floating. CPOL=0,
+; CPHA=0: data is driven while SCLK is low and sampled on the rising edge.
+;
+; Read completion and write back-pressure are CPU/DMA events, not PIO IRQs:
+; the read loop clocks until the CPU stops the SM, and the write loop blocks
+; on PULL when the DMA has no more words. This keeps the program small and
+; avoids an extra IRQ path on the timing-critical cartridge core.
+;
+; Autopull is disabled: a blocking PULL explicitly loads the command/address
+; word and each write word, so the read program can leave the OSR empty after
+; the address without stalling. Autopush is enabled on the RX side.
+.program psram_quad
+.side_set 1
+
+; --------------------------------------------------------------------------
+; Entry: psram_quad_read
+;   TX: one word = (0xEB << 24) | addr
+;   RX: 4-bit data nibbles, autopushed 8 nibbles (32 bits) per word
+; --------------------------------------------------------------------------
+public psram_quad_read:
+    pull                    side 0  ; command + address word
+    set x, 7                side 0
+rd_serial:
+    out pins, 1             side 0  ; drive SIO0 while SCLK low
+    jmp x-- rd_serial       side 1  ; rising edge: PSRAM samples
+    set y, 5                side 0
+rd_addr:
+    out pins, 4             side 0  ; 4-bit address nibble while SCLK low
+    jmp y-- rd_addr         side 1  ; rising edge: PSRAM samples
+    set pindirs, 0          side 0  ; release SIO0..3 for the read data phase
+    set x, 5                side 0
+rd_dummy:
+    nop                     side 1
+    jmp x-- rd_dummy        side 0  ; six dummy clocks, ending SCLK low
+rd_data:
+    nop                     side 1  ; SCLK high, let the device output settle
+    in pins, 4              side 1  ; sample quad data a half-cycle later
+    jmp rd_data             side 0
+
+; --------------------------------------------------------------------------
+; Entry: psram_quad_write
+;   TX: word0 = (0x38 << 24) | addr, then one word per 4 data bytes
+; --------------------------------------------------------------------------
+public psram_quad_write:
+    pull                    side 0
+    set x, 7                side 0
+wr_serial:
+    out pins, 1             side 0
+    jmp x-- wr_serial       side 1
+    set y, 5                side 0
+wr_addr:
+    out pins, 4             side 0
+    jmp y-- wr_addr         side 1
+wr_data:
+public psram_quad_write_idle:
+    pull                    side 0  ; block until the next data word arrives
+    set x, 7                side 0
+wr_nib:
+    out pins, 4             side 0  ; drive data while SCLK low
+    nop                     side 0  ; setup margin before the clock edge
+    jmp x-- wr_nib          side 1
+    jmp wr_data             side 0

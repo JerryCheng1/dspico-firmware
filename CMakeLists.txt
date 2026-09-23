@@ -46,6 +46,60 @@ add_compile_definitions(DSpico
 # boot-time output and leaves the real-time cartridge path untouched.
 option(ENABLE_UART_LOG "Boot-time UART logging (no runtime tracing)" OFF)
 option(ENABLE_CART_TRACE "Cartridge runtime diagnostics (requires ENABLE_UART_LOG)" OFF)
+# Stage S2: build the standalone APS6404L qualification firmware. It is a
+# separate executable and never links the cartridge runtime.
+option(PSRAM_QUAL_FIRMWARE "Build the standalone APS6404L (PSRAM) qualification firmware" OFF)
+option(PSRAM_QUAL_FULL "Qualification firmware: walk the full 8 MiB of every chip" OFF)
+
+# Design section 11.1 stage switches. CACHE_STAGE gates which cache modules are
+# linked at all; CACHE_INIT_LOG/CACHE_STATS_LOG add bounded diagnostics and are
+# independent of each other (stats requires the init log). Inconsistent
+# combinations are rejected here rather than silently compiling a stage that
+# the design does not allow.
+set(CACHE_STAGE "0" CACHE STRING "Cache development stage (0..10)")
+option(CACHE_INIT_LOG "Bounded asynchronous init log (requires ENABLE_UART_LOG)" OFF)
+option(CACHE_STATS_LOG "Low-rate cache statistics log (requires CACHE_INIT_LOG)" OFF)
+option(CACHE_L2_DISABLED "Force the PSRAM L2 read cache off (SRAM front-end regression)" OFF)
+# Design section 10 diagnostic mode. M0..M5 isolate bring-up, snapshot cost,
+# backfill coexistence, transfer/generation and the real hit path. This is the
+# build knob the staged comparison in the r3 fix design requires; it is NOT a
+# claim that any mode has been validated on hardware.
+set(L2_DIAG_MODE "M5" CACHE STRING "L2 diagnostic mode M0..M5 (design section 10)")
+# M3 contrast build only (design section 10): reproduce the old "publish then
+# fill in the same round" behaviour so the new post-handover admission can be
+# compared with ONE variable changed. Must stay OFF and must never become the
+# default after acceptance.
+option(L2_LEGACY_PUBLISH_FILL "Contrast build: old publish-then-fill behaviour (M3 only)" OFF)
+option(CACHE_WATCH_LOG "Core1 hang diagnostics, independent of the core0 loop and bus idle" OFF)
+set(CACHE_BUILD_GIT_REV "" CACHE STRING "Git revision embedded in the cache boot banner")
+
+if(CACHE_STAGE LESS 0 OR CACHE_STAGE GREATER 10)
+  message(FATAL_ERROR "CACHE_STAGE must be 0..10")
+endif()
+# Only S0..S3 are implemented. Refuse to build a later stage so a stage
+# number can never be mistaken for a passed hardware validation.
+if(CACHE_STAGE GREATER 3)
+  message(FATAL_ERROR
+    "CACHE_STAGE=${CACHE_STAGE} is not implemented yet; S0..S3 are the "
+    "only buildable stages (design section 11.1).")
+endif()
+if(CACHE_INIT_LOG AND NOT ENABLE_UART_LOG)
+  message(FATAL_ERROR "CACHE_INIT_LOG requires ENABLE_UART_LOG=ON")
+endif()
+if(CACHE_INIT_LOG AND CACHE_STAGE LESS 1)
+  message(FATAL_ERROR "CACHE_INIT_LOG requires CACHE_STAGE>=1")
+endif()
+if(CACHE_STATS_LOG AND NOT CACHE_INIT_LOG)
+  message(FATAL_ERROR "CACHE_STATS_LOG requires CACHE_INIT_LOG=ON")
+endif()
+if(CACHE_WATCH_LOG)
+  if(CACHE_STAGE LESS 3 OR NOT ENABLE_UART_LOG)
+    message(FATAL_ERROR "CACHE_WATCH_LOG requires CACHE_STAGE>=3 and ENABLE_UART_LOG=ON")
+  endif()
+  if(CACHE_INIT_LOG OR CACHE_STATS_LOG OR ENABLE_CART_TRACE)
+    message(FATAL_ERROR "CACHE_WATCH_LOG owns runtime UART: disable CACHE_INIT_LOG, CACHE_STATS_LOG and ENABLE_CART_TRACE")
+  endif()
+endif()
 if(ENABLE_CART_TRACE AND NOT ENABLE_UART_LOG)
   message(FATAL_ERROR
     "ENABLE_CART_TRACE requires ENABLE_UART_LOG=ON: the runtime tracers emit "
@@ -55,7 +109,7 @@ endif()
 
 # Unique per-build tag printed on the UART boot banner so each flashed build is
 # verifiable. Pass -DUART_LOG_BUILD_TAG=... at configure time.
-set(UART_LOG_BUILD_TAG "" CACHE STRING "Boot banner build tag override")
+set(UART_LOG_BUILD_TAG "cache-send-r5" CACHE STRING "Boot banner build tag override")
 
 add_executable(DSpico
   src/main.cpp
@@ -119,9 +173,106 @@ if(UART_LOG_BUILD_TAG)
   target_compile_definitions(DSpico PRIVATE UART_LOG_BUILD_TAG="${UART_LOG_BUILD_TAG}")
 endif()
 
+target_compile_definitions(DSpico PRIVATE CACHE_STAGE=${CACHE_STAGE})
+if(CACHE_INIT_LOG)
+  target_compile_definitions(DSpico PRIVATE CACHE_INIT_LOG=1)
+endif()
+if(CACHE_STATS_LOG)
+  target_compile_definitions(DSpico PRIVATE CACHE_STATS_LOG=1)
+endif()
+if(CACHE_WATCH_LOG)
+  target_compile_definitions(DSpico PRIVATE CACHE_WATCH_LOG=1)
+endif()
+if(CACHE_STAGE GREATER_EQUAL 3)
+  if(CACHE_L2_DISABLED)
+    # F1/F2 regression: keep the front-end/job/slot state machine but never
+    # enable the PSRAM read cache, so the same build can be compared against the
+    # SD-only path (design section 11.3). A forced-off build overrides any
+    # diagnostic mode (r3 fix design section 10).
+    target_compile_definitions(DSpico PRIVATE CACHE_L2_DISABLED=1)
+    target_compile_definitions(DSpico PRIVATE CACHE_L2_MODE=0)
+  else()
+    string(TOUPPER "${L2_DIAG_MODE}" _l2diag_upper)
+    if(_l2diag_upper STREQUAL "M0")
+      set(_l2diag_num 0)
+    elseif(_l2diag_upper STREQUAL "M1")
+      set(_l2diag_num 1)
+    elseif(_l2diag_upper STREQUAL "M2")
+      set(_l2diag_num 2)
+    elseif(_l2diag_upper STREQUAL "M3")
+      set(_l2diag_num 3)
+    elseif(_l2diag_upper STREQUAL "M4")
+      set(_l2diag_num 4)
+    elseif(_l2diag_upper STREQUAL "M5")
+      set(_l2diag_num 5)
+    else()
+      message(FATAL_ERROR "L2_DIAG_MODE must be M0..M5, got '${L2_DIAG_MODE}'")
+    endif()
+    target_compile_definitions(DSpico PRIVATE CACHE_L2_MODE=${_l2diag_num})
+  endif()
+endif()
+if(L2_LEGACY_PUBLISH_FILL)
+  if(CACHE_STAGE LESS 3)
+    message(FATAL_ERROR "L2_LEGACY_PUBLISH_FILL requires CACHE_STAGE>=3")
+  endif()
+  message(WARNING "L2_LEGACY_PUBLISH_FILL=ON: contrast-only build, not for acceptance")
+  target_compile_definitions(DSpico PRIVATE CACHE_L2_LEGACY_PUBLISH_FILL=1)
+endif()
+if(CACHE_BUILD_GIT_REV)
+  target_compile_definitions(DSpico PRIVATE CACHE_BUILD_GIT_REV="${CACHE_BUILD_GIT_REV}")
+endif()
+if(CACHE_STAGE GREATER_EQUAL 1)
+  # S1 resource registry and bounded init log. Not linked at stage 0 so the
+  # baseline image stays byte-identical (design section 11.3 rollback).
+  target_sources(DSpico PRIVATE
+    src/cacheResourcePlan.c
+    src/cacheResourcePlan.h
+    src/cacheInitLog.c
+    src/cacheInitLog.h
+    src/cacheInitLogRing.h
+  )
+endif()
+
+if(CACHE_STAGE GREATER_EQUAL 3)
+  # S3: PSRAM sector cache for the E3/E4/E5 path. Adds the PSRAM engine
+  # (PIO2 SM0 + DMA4/5) and the cache service; stage 0..2 images are unchanged.
+  target_sources(DSpico PRIVATE
+    src/cacheSd.c
+    src/cacheSd.h
+    src/cacheSlots.c
+    src/cacheSlots.h
+    src/psram.c
+    src/psram.h
+  )
+  pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
+endif()
+
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCard.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCardTrace.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2350_sdio.pio)
+
+if(PSRAM_QUAL_FIRMWARE)
+  add_executable(PsramQual
+    src/psramQualMain.c
+    src/psram.c
+    src/psram.h
+    src/uartLog.c
+    src/uartLog.h
+    src/psram.pio
+  )
+  # The qualification boot always logs over UART1.
+  target_compile_definitions(PsramQual PRIVATE ENABLE_UART_LOG=1)
+  if(PSRAM_QUAL_FULL)
+    target_compile_definitions(PsramQual PRIVATE PSRAM_QUAL_FULL=1)
+  endif()
+  if(UART_LOG_BUILD_TAG)
+    target_compile_definitions(PsramQual PRIVATE UART_LOG_BUILD_TAG="${UART_LOG_BUILD_TAG}")
+  endif()
+  pico_generate_pio_header(PsramQual ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
+  pico_enable_stdio_uart(PsramQual 0)
+  pico_add_extra_outputs(PsramQual)
+  target_link_libraries(PsramQual pico_stdlib hardware_pio hardware_dma)
+endif()
 
 pico_enable_stdio_uart(DSpico 0)
 pico_add_extra_outputs(DSpico)

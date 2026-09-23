@@ -1,0 +1,1132 @@
+#include "cacheSd.h"
+
+#if CACHE_SD_ENABLED
+#include <string.h>
+
+#ifndef CACHE_SD_HOST
+#include "common.h"
+#include "hardware/sync.h"
+#include "hardware/dma.h"
+#include "hardware/gpio.h"
+#include "psram.h"
+CACHE_RAM_CODE const cacheSdHw* cacheSdDefaultHw(void);
+#endif
+
+// ---------------------------------------------------------------------------
+// Durability / namespace model
+//
+//   sCacheEpoch   L2 namespace generation. Bumped once per accepted write
+//                 sequence (in lockstep with the cs write generation).
+//   source_epoch  captured at job accept time; a fill inherits it and never
+//                 reads "the current epoch" as a substitute (design 13.3/R2).
+// ---------------------------------------------------------------------------
+static uint32_t sTag[CACHE_SD_SECTORS];
+static uint32_t sTagEpoch[CACHE_SD_SECTORS];
+static uint32_t sCrc[CACHE_SD_SECTORS];
+static uint8_t sState[CACHE_SD_SECTORS];   // 0 empty, 1 filling, 2 ready
+static uint32_t sCrcTab[256];
+static volatile uint32_t sCacheEpoch = 1;
+
+// L0 response slots handed to E5/DMA0.
+static uint8_t sSlotBuf[CS_SLOT_COUNT][CS_SECTOR_BYTES] __attribute__((aligned(4)));
+
+// Demand I/O staging: the single buffer every SD/L2 demand read lands in. It
+// is copied into the response slot (and the backfill snapshot) only after
+// verification, so the SD DMA destination is never the published response.
+static uint8_t sDemandStage[CS_SECTOR_BYTES] __attribute__((aligned(4)));
+
+// Independent SD fallback buffer (design section 11). If a PSRAM read failed,
+// the demand may only continue from a buffer the failed transport was never
+// allowed to touch; the staging buffer is not reused for SD in that case.
+static uint8_t sFallbackStage[CS_SECTOR_BYTES] __attribute__((aligned(4)));
+
+// Backfill snapshot, independent of the response slot and of sDemandStage once
+// it has been taken (design section 7).
+static uint8_t sFillStage[CS_SECTOR_BYTES] __attribute__((aligned(4)));
+
+static cs_state sCs;
+static const cacheSdHw* sHw;
+static bool sEnabled;
+#ifndef CACHE_L2_MODE
+#define CACHE_L2_MODE 5
+#endif
+static uint8_t sL2Mode = (uint8_t)CACHE_L2_MODE;
+
+// L2 data path degraded (design section 11): no new hit/fill admission, the
+// already-published SRAM responses are kept and SD service continues.
+static uint8_t sDegraded;
+
+// Demand job (single, main-loop owned).
+static cs_job sJob;
+static uint8_t sJobActive;
+static uint8_t sJobSrc;       // 0 = SD, 1 = L2
+static uint8_t sJobSdStarted;
+static uint8_t sJobUseFallback;
+static uint32_t sJobOff;
+static uint32_t sJobCrc;
+static uint32_t sJobL2Idx;
+static uint32_t sJobL2Epoch;
+static uint32_t sJobSdToken;
+
+// Backfill lifecycle (design section 7.1). A snapshot is taken only after the
+// demand response has been published, and its transport is admitted only once
+// the response it was derived from has finished its E5/DMA0 transfer. This is
+// the H1 isolation: no background PSRAM work is started in the handover
+// window or in the same cacheSdStep() that published the demand.
+enum
+{
+    FILL_NONE = 0,
+    FILL_SNAPSHOT_PENDING,   // reserved (copy is formed immediately on target)
+    FILL_SNAPSHOT_READY,     // independent snapshot taken; waiting for DMA0 end
+    FILL_ADMITTED,           // demand transfer ended; transport may start
+    FILL_TRANSFERRING,       // fragments in flight
+    FILL_VERIFIED,           // whole snapshot written and CRC computed
+    FILL_COMMITTED,          // directory committed
+    FILL_DROP,               // discarded before commit
+    FILL_CANCEL_REQUESTED,   // drop requested mid-transfer
+    FILL_CLEANUP,            // bounded wrap-up
+    FILL_RETIRED,            // finished, buffer reusable
+    FILL_QUARANTINED,        // not proven quiescent; not reused
+};
+static const char* const sFillStateNames[] = {
+    "NONE", "SNAPSHOT_PENDING", "SNAPSHOT_READY", "ADMITTED", "TRANSFERRING",
+    "VERIFIED", "COMMITTED", "DROP", "CANCEL_REQUESTED", "CLEANUP", "RETIRED",
+    "QUARANTINED",
+};
+
+// Why a new backfill was refused / a pending one was dropped (design 7.1).
+enum
+{
+    FILL_DROP_NONE = 0,
+    FILL_DROP_NO_SLOT,
+    FILL_DROP_EXISTING,
+    FILL_DROP_DEMAND,
+    FILL_DROP_WINDOW,
+    FILL_DROP_SUPERSEDED,
+    FILL_DROP_EPOCH,
+    FILL_DROP_MODE,
+    FILL_DROP_DEGRADE,
+    FILL_DROP_BUDGET,
+};
+
+static uint8_t sFillState;
+static uint8_t sFillIsProbe; // M4 READ_PROBE: verify the entry instead of writing it
+static uint8_t sProbeChunk[PSRAM_CACHE_FRAG_BYTES]; // independent probe buffer
+static uint8_t sFillDropReason;
+static uint8_t sFillWaitSlot;
+static uint32_t sFillWaitVersion;
+static uint8_t sDidPublish;    // a demand was published during this step
+// Immutable snapshot identity (design 7.1): sector, source media/write/cache
+// epoch, source request/job ID, snapshot id and fragment position.
+static uint32_t sFillSector, sFillIdx, sFillOff, sFillCrc, sFillEpoch;
+static uint32_t sFillMediaEpoch, sFillWriteEpoch, sFillReqId, sFillJobId, sFillSnapshotId;
+
+// Defined in the main-loop section below; declared here because the DMA
+// completion path (IRQ context) decides backfill admission.
+static CACHE_RAM_CODE void fillAbortReason(uint8_t reason);
+static CACHE_RAM_CODE void fillAdmitLocked(void);
+
+// DMA0-owned response slot tracking (written by E5/DMA-done and the main-loop
+// reclaim, always inside a critical section).
+static uint8_t sDmaValid, sDmaSlot;
+static uint32_t sDmaVersion;
+
+static volatile uint32_t sHits, sMisses, sFills, sErrors;
+
+// Categorized counters (design section 9.1). Monotonic; read without masking
+// interrupts because they are diagnostic only.
+static volatile uint32_t sSdTokenObsolete, sSdTokenLiveConflict, sSdTransferError;
+static volatile uint32_t sL2HitAttempt, sL2HitVerified, sL2CrcFail;
+static volatile uint32_t sPsramReadFail, sPsramFillFail;
+static volatile uint32_t sFillAdmit, sFillDrop, sFillDefer, sFillCommit, sFillQuarantine;
+volatile uint32_t gCacheSdReadReady;
+// Published only by E4 after full identity/slot validation. All revocations
+// run on core0, serialized by the cartridge IRQ priority / main-loop mask.
+static uint8_t* sAckedData;
+static volatile cacheSdTxSnapshot sLastTx;
+
+
+// Time budgets (design 7.4). Units are microseconds and the values are
+// placeholders that MUST be replaced by measured bounds before the final
+// acceptance; they are runtime-settable so the host tests can drive them.
+// Loop counts and nominal clock rates are explicitly NOT accepted as worst-case
+// time bounds. A fragment whose bound is not qualified (D4) stays out.
+#ifndef CACHE_T_STEP_MAX_US
+#define CACHE_T_STEP_MAX_US 250u
+#endif
+#ifndef CACHE_T_FRAGMENT_MAX_US
+#define CACHE_T_FRAGMENT_MAX_US 80u
+#endif
+#ifndef CACHE_T_CLEANUP_MAX_US
+#define CACHE_T_CLEANUP_MAX_US 100u
+#endif
+#ifndef CACHE_T_IDLE_ADMIT_US
+#define CACHE_T_IDLE_ADMIT_US 0u
+#endif
+static uint32_t sTStepMaxUs = CACHE_T_STEP_MAX_US;
+static uint32_t sTFragmentMaxUs = CACHE_T_FRAGMENT_MAX_US;
+static uint32_t sTCleanupMaxUs = CACHE_T_CLEANUP_MAX_US;
+static uint32_t sTIdleAdmitUs = CACHE_T_IDLE_ADMIT_US;
+
+// M3 contrast build (design section 10): reproduce the old "publish then fill
+// in the same round" behaviour for one-variable comparison. MUST stay off and
+// MUST NOT become the default after acceptance.
+#if defined(CACHE_L2_LEGACY_PUBLISH_FILL)
+#define FILL_LEGACY_PUBLISH 1
+#else
+#define FILL_LEGACY_PUBLISH 0
+#endif
+
+// ---------------------------------------------------------------------------
+
+static inline CACHE_RAM_CODE uint32_t cacheIdx(uint32_t sector) { return sector & (CACHE_SD_SECTORS - 1u); }
+
+// Buffer currently holding the demand payload (fallback after a PSRAM fault).
+static inline CACHE_RAM_CODE uint8_t* jobBuf(void)
+{
+    return sJobUseFallback ? sFallbackStage : sDemandStage;
+}
+
+static CACHE_RAM_CODE uint32_t crc32Update(uint32_t crc, const uint8_t* p, uint32_t n)
+{
+    while (n--)
+        crc = sCrcTab[(crc ^ *p++) & 0xFFu] ^ (crc >> 8);
+    return crc;
+}
+
+// Derived fast ready (design 6.2). The value is computed from the response
+// descriptor, never an independent truth.
+CACHE_RAM_CODE bool cacheSdFastReady(void)
+{
+    if (!sCs.intent_valid || sCs.write_pending)
+        return false;
+    if (sCs.completion_valid &&
+        cs_identity_equal(&sCs.completion.id, &sCs.intent) &&
+        sCs.completion.id.write_epoch == sCs.write_epoch &&
+        sCs.completion.result == CS_RES_OK)
+        return true;
+    if (sCs.binding_valid &&
+        cs_identity_equal(&sCs.binding.id, &sCs.intent) &&
+        sCs.binding.id.write_epoch == sCs.write_epoch)
+        return true;
+    return false;
+}
+
+static CACHE_RAM_CODE void refreshFastReady(void)
+{
+    gCacheSdReadReady = cacheSdFastReady() ? 1u : 0u;
+    if (!gCacheSdReadReady)
+        sAckedData = NULL;
+}
+
+CACHE_RAM_CODE uint8_t* cacheSdSlotBuffer(uint8_t slot);
+
+CACHE_RAM_CODE void cacheSdSetHw(const cacheSdHw* hw)
+{
+    sHw = hw;
+}
+
+CACHE_RAM_CODE void cacheSdSetTimeBudgets(uint32_t step_us, uint32_t fragment_us,
+                                          uint32_t cleanup_us, uint32_t idle_admit_us)
+{
+    sTStepMaxUs = step_us;
+    sTFragmentMaxUs = fragment_us;
+    sTCleanupMaxUs = cleanup_us;
+    sTIdleAdmitUs = idle_admit_us;
+}
+
+CACHE_RAM_CODE void cacheSdInit(void)
+{
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        sCrcTab[i] = c;
+    }
+#ifndef CACHE_SD_HOST
+    if (!sHw)
+        sHw = cacheSdDefaultHw();
+#endif
+    memset(sState, 0, sizeof(sState));
+    memset(sTagEpoch, 0, sizeof(sTagEpoch));
+    sCacheEpoch = 1;
+    cs_init(&sCs);
+    sJobActive = 0;
+    sJobUseFallback = 0;
+    sFillState = FILL_NONE;
+    sFillIsProbe = 0;
+    sFillDropReason = FILL_DROP_NONE;
+    sDidPublish = 0;
+    sDmaValid = 0;
+    sDegraded = 0;
+    gCacheSdReadReady = 0;
+    sAckedData = NULL;
+    memset((void*)&sLastTx, 0, sizeof(sLastTx));
+    sHits = sMisses = sFills = sErrors = 0;
+    sSdTokenObsolete = sSdTokenLiveConflict = sSdTransferError = 0;
+    sL2HitAttempt = sL2HitVerified = sL2CrcFail = 0;
+    sPsramReadFail = sPsramFillFail = 0;
+    sFillAdmit = sFillDrop = sFillDefer = sFillCommit = sFillQuarantine = 0;
+    sEnabled = false;
+}
+
+CACHE_RAM_CODE void cacheSdSetEnabled(bool enabled)
+{
+    sEnabled = enabled;
+    refreshFastReady();
+}
+
+CACHE_RAM_CODE void cacheSdSetMode(uint8_t mode) { sL2Mode = mode; }
+CACHE_RAM_CODE uint8_t cacheSdMode(void) { return sL2Mode; }
+
+CACHE_RAM_CODE void cacheSdDegrade(uint32_t reason)
+{
+    uint32_t save = sHw->irqSave();
+    sDegraded = 1;
+    cs_set_degraded(&sCs, true);
+    // Close new fill admission but keep already-published SRAM responses.
+    if (sFillState == FILL_SNAPSHOT_READY || sFillState == FILL_ADMITTED ||
+        sFillState == FILL_TRANSFERRING)
+        fillAbortReason(FILL_DROP_DEGRADE);
+    cs_note_fault_ex(&sCs, CS_FAULT_DEGRADE, reason, CS_PRODUCER_MAIN, reason, 0);
+    refreshFastReady();
+    sHw->irqRestore(save);
+}
+
+CACHE_RAM_CODE bool cacheSdDegraded(void) { return sDegraded != 0; }
+
+CACHE_RAM_CODE const char* cacheSdFillStateName(void)
+{
+    if (sFillState >= sizeof(sFillStateNames) / sizeof(sFillStateNames[0]))
+        return "?";
+    return sFillStateNames[sFillState];
+}
+
+CACHE_RAM_CODE uint32_t cacheSdFillDropReason(void) { return sFillDropReason; }
+
+// ---------------------------------------------------------------------------
+// IRQ entry points (bounded, no I/O)
+// ---------------------------------------------------------------------------
+
+// Release a finished DMA0 slot. The tracking identity, the DMA state check and
+// the matching release all happen in one critical section so a new E5 cannot
+// slip between the check and the release (design 13.2/R1).
+static CACHE_RAM_CODE void dmaReclaimLocked(void)
+{
+    if (!sDmaValid)
+        return;
+    // Snapshot the transmission identity before the (possibly reentrant) DMA
+    // state query, so a send bound during the query can never be released by
+    // mistake (design 13.2/R1, T20).
+    uint8_t slot = sDmaSlot;
+    uint32_t ver = sDmaVersion;
+    if (sHw->dma0Busy())
+        return;
+    // The demand transfer for this slot is complete: the response's handover
+    // window is closed and its backfill may now be admitted (design 7.3).
+    if (sFillState == FILL_SNAPSHOT_READY && slot == sFillWaitSlot && ver == sFillWaitVersion)
+        fillAdmitLocked();
+    cs_dma_done(&sCs, slot, ver);
+    if (sDmaValid && sDmaSlot == slot && sDmaVersion == ver)
+        sDmaValid = 0;
+    sCs.c_dma_reclaim++;
+}
+
+CACHE_RAM_CODE void cacheSdDmaDone(void)
+{
+    uint32_t save = sHw->irqSave();
+    if (sDmaValid)
+    {
+        if (sFillState == FILL_SNAPSHOT_READY && sDmaSlot == sFillWaitSlot &&
+            sDmaVersion == sFillWaitVersion)
+            fillAdmitLocked();
+        cs_dma_done(&sCs, sDmaSlot, sDmaVersion);
+        sDmaValid = 0;
+    }
+    sHw->irqRestore(save);
+}
+
+CACHE_RAM_CODE uint32_t cacheSdRequest(uint32_t sector)
+{
+    uint32_t result = cs_read_intent(&sCs, sector);
+    refreshFastReady();
+    return result;
+}
+
+CACHE_RAM_CODE bool cacheSdPollReadySampled(bool queued_ready)
+{
+    if (!queued_ready)
+    {
+        sCs.c_e4_busy++;
+        return false; // a busy word cannot acknowledge an offer
+    }
+    bool ready = cs_poll_read(&sCs);
+    if (queued_ready && !ready)
+    {
+        // A ready=1 was already in the FIFO but no binding could be made. This
+        // is the H2/H3 signature; freeze it and never rewrite the frame.
+        sCs.c_e4_ack_failed++;
+        cs_note_e4_ack_failed(&sCs, 1);
+    }
+    else if (ready)
+    {
+        sCs.c_e4_ready_queued++;
+    }
+    else
+    {
+        sCs.c_e4_busy++;
+    }
+    refreshFastReady();
+    // The old DMA may be finished but not reclaimed yet. Do that after the
+    // E4 status store, not on the next E5's first-data deadline.
+    dmaReclaimLocked();
+    sAckedData = ready && cs_e5_precheck(&sCs) && !sDmaValid
+                     ? sSlotBuf[sCs.binding.slot] : NULL;
+    return ready;
+}
+
+CACHE_RAM_CODE bool cacheSdPollReady(void)
+{
+    return cacheSdPollReadySampled(cacheSdFastReady());
+}
+
+CACHE_RAM_CODE bool cacheSdE5Precheck(void)
+{
+    return cs_e5_precheck(&sCs);
+}
+
+CACHE_RAM_CODE void cacheSdMarkE5Recovery(void)
+{
+    // The precise reject reason is frozen by cs_consume_read(); this only counts
+    // that the E5 entered the bounded recovery (no length armed, no data fed).
+    sCs.c_e5_recovery++;
+}
+
+// Hot E5 path. The lease implies the SAME immutable binding fully checked
+// at E4. E3 replacement, write/reset/media and normal consume revoke it via
+// refreshFastReady(). Main cannot replace an accepted response. The caller
+// must be the highest-priority cartridge IRQ; no callback or mask is needed.
+CACHE_RAM_CODE uint8_t* cacheSdTakeAckedFromIrq(uint32_t* sector)
+{
+    uint8_t* data = sAckedData;
+    if (!data)
+        return NULL;
+#ifdef CACHE_SD_HOST
+    if (sHw->dma0Busy())
+#else
+    if (dma_channel_is_busy(0))
+#endif
+        return NULL; // never overwrite a live DMA, including a non-SD owner
+    sAckedData = NULL;
+    uint8_t slot = sCs.binding.slot;
+    sCs.slots[slot].state = CS_SLOT_DMA;
+    sDmaSlot = slot;
+    sDmaVersion = sCs.binding.slot_version;
+    sDmaValid = 1;
+    *sector = sCs.binding.id.sector;
+    sCs.binding_valid = 0;
+    sCs.acked_offer_id = 0;
+    sCs.intent_valid = 0;
+    sCs.intent_consumed = 0;
+    sCs.resp_state = CS_RESP_SENDING;
+    sCs.last_invalidate_reason = CS_INV_CONSUMED;
+    gCacheSdReadReady = 0;
+    return data;
+}
+
+CACHE_RAM_CODE void cacheSdRejectSendFromIrq(void)
+{
+    uint32_t sector, version;
+    uint8_t slot;
+    if (!cs_e5_precheck(&sCs))
+        (void)cs_consume_read(&sCs, &sector, &slot, &version); // classify only
+    else
+    {
+        // Valid logical response but no usable lease / DMA still busy.
+        sCs.c_protocol_fault++;
+        cs_note_fault_ex(&sCs, CS_FAULT_E5_RECOVERY, 1,
+                         CS_PRODUCER_IRQ_E5, sDmaValid, 0);
+    }
+}
+
+CACHE_RAM_CODE void cacheSdRecordSendFromIrq(uint32_t sector, const uint8_t* data)
+{
+    // Called after DMA starts, still in the same IRQ before any next demand.
+    sCs.c_e5_ok++;
+    sLastTx.sector = sector;
+    memcpy((void*)&sLastTx.head, data, 4);
+    memcpy((void*)&sLastTx.tail, data + CS_SECTOR_BYTES - 4, 4);
+    sLastTx.offer = sCs.binding.offer_id;
+    sLastTx.sends++;
+}
+
+CACHE_RAM_CODE const volatile cacheSdTxSnapshot* cacheSdLastTx(void) { return &sLastTx; }
+
+CACHE_RAM_CODE bool cacheSdConsume(uint32_t* sector, uint8_t* slot, uint32_t* slot_version)
+{
+    // Reclaim a finished previous transmission and bind the new one under the
+    // same critical section, so the tracking fields can never refer to a
+    // mixture of the old and the new send.
+    uint32_t save = sHw->irqSave();
+    dmaReclaimLocked();
+    bool ok = cs_consume_read(&sCs, sector, slot, slot_version);
+    if (ok)
+    {
+        sDmaSlot = *slot;
+        sDmaVersion = *slot_version;
+        sDmaValid = 1;
+    }
+    refreshFastReady();
+    sHw->irqRestore(save);
+    return ok;
+}
+
+CACHE_RAM_CODE uint32_t cacheSdWriteBegin(void)
+{
+    uint32_t save = sHw->irqSave();
+    uint32_t before = sCs.write_epoch;
+    uint32_t token = cs_write_begin(&sCs);
+    if (sCs.write_epoch != before)
+    {
+        uint32_t e = sCacheEpoch + 1u;
+        if (e == 0)
+            e = 1;
+        sCacheEpoch = e;
+    }
+    refreshFastReady();
+    sHw->irqRestore(save);
+    return token;
+}
+
+CACHE_RAM_CODE void cacheSdWriteEnd(uint32_t token)
+{
+    uint32_t save = sHw->irqSave();
+    cs_write_end(&sCs, token);
+    refreshFastReady();
+    sHw->irqRestore(save);
+}
+
+CACHE_RAM_CODE void cacheSdResetCart(void)
+{
+    uint32_t save = sHw->irqSave();
+    cs_reset_cart(&sCs);
+    refreshFastReady();
+    sHw->irqRestore(save);
+}
+
+CACHE_RAM_CODE void cacheSdSetMediaEpoch(uint32_t media_epoch)
+{
+    uint32_t save = sHw->irqSave();
+    cs_set_media_epoch(&sCs, media_epoch);
+    // Medium identity changed: any cached sector may belong to the previous
+    // medium, so advance the namespace and let entries be re-matched by a new
+    // request (design section 9.1).
+    uint32_t e = sCacheEpoch + 1u;
+    if (e == 0)
+        e = 1;
+    sCacheEpoch = e;
+    refreshFastReady();
+    sHw->irqRestore(save);
+}
+
+// ---------------------------------------------------------------------------
+// Main-loop service
+// ---------------------------------------------------------------------------
+
+// Record a main-loop fault under the interrupt mask. The first-fault slot has
+// two producers (cartridge IRQ and core0 main loop); masking makes each record
+// atomic instead of treating them as one lock-free SPSC ring (design 9.2).
+static CACHE_RAM_CODE void noteFaultLocked(uint8_t kind, uint32_t detail)
+{
+    uint32_t save = sHw->irqSave();
+    cs_note_fault(&sCs, kind, detail);
+    sHw->irqRestore(save);
+}
+
+// Retire a job that produced no publishable result (cancel/fault). A still-live
+// intent is re-armed for a bounded retry; anything else is retired (13.5/R4).
+static CACHE_RAM_CODE void jobFinish(uint8_t result)
+{
+    (void)result;
+    uint32_t save = sHw->irqSave();
+    cs_job_requeue(&sCs, &sJob);
+    refreshFastReady();
+    sHw->irqRestore(save);
+
+    sJobActive = 0;
+    sJobSdStarted = 0;
+}
+
+static CACHE_RAM_CODE void fillAbortReason(uint8_t reason)
+{
+    if (sFillState == FILL_NONE)
+        return;
+    if (sState[sFillIdx] == 1)
+        sState[sFillIdx] = 0;
+    sFillDropReason = reason;
+    sFillIsProbe = 0;
+    sFillState = FILL_DROP;
+}
+
+// Admit (or discard) a snapshot whose source response has finished its send.
+// Only used from the DMA-completion path, inside the caller's critical section.
+static CACHE_RAM_CODE void fillAdmitLocked(void)
+{
+    if (sFillState != FILL_SNAPSHOT_READY)
+        return;
+    if (!sDegraded && sL2Mode >= CACHE_L2_MODE_M3)
+    {
+        // Admission is unconditional on the DMA end; the idle gate is applied
+        // only to the ADMITTED -> TRANSFERRING start, so a slot released here
+        // can never make fillReconcile() drop an admitted snapshot.
+        sFillState = FILL_ADMITTED;
+        sFillAdmit++;
+    }
+    else
+    {
+        // M2, degraded or SNAPSHOT_ONLY: pay the copy cost but never touch
+        // PSRAM data.
+        fillAbortReason(sL2Mode >= CACHE_L2_MODE_M3 ? FILL_DROP_DEGRADE : FILL_DROP_MODE);
+        sFillDrop++;
+    }
+}
+
+// Publish a verified demand read: copy the staging buffer into a response slot,
+// commit it, then take an independent backfill snapshot. The snapshot's
+// transport is NOT started here; admission waits for the published response's
+// E5/DMA0 transfer to end (design sections 7.2/7.3, H1 isolation).
+static CACHE_RAM_CODE void publishVerified(void)
+{
+    memcpy(sSlotBuf[sJob.slot], jobBuf(), CS_SECTOR_BYTES);
+
+    uint32_t save = sHw->irqSave();
+    cs_completion c;
+    c.id = sJob.id;
+    c.job_id = sJob.job_id;
+    c.slot = sJob.slot;
+    c.slot_version = sJob.slot_version;
+    c.result = CS_RES_OK;
+    bool committed = cs_commit(&sCs, &c);
+    if (!committed)
+        cs_job_requeue(&sCs, &sJob);
+    refreshFastReady();
+    sHw->irqRestore(save);
+
+    if (committed && sEnabled && !sDegraded && sJobSrc == 0 &&
+        sL2Mode >= CACHE_L2_MODE_M2)
+    {
+        uint32_t pidx = cacheIdx(sJob.id.sector);
+        bool haveEntry = (sState[pidx] == 2 && sTagEpoch[pidx] == sJob.source_epoch &&
+                          sTag[pidx] == sJob.id.sector);
+        // M4 verifies an existing entry against the SD reference (design 10);
+        // M3/M5 schedule a normal write-backfill.
+        bool wantProbe = (sL2Mode == CACHE_L2_MODE_M4) && haveEntry;
+        bool want = true; // cold M4 must first populate entries to probe
+        if (want && sFillState == FILL_NONE)
+        {
+            // The demand staging buffer is still held by this job, so the
+            // snapshot copy cannot alias an SD/DMA destination (design 7.2).
+            memcpy(sFillStage, jobBuf(), CS_SECTOR_BYTES);
+            sFillSector = sJob.id.sector;
+            sFillIdx = cacheIdx(sJob.id.sector);
+            sFillOff = 0;
+            sFillCrc = 0xFFFFFFFFu;
+            sFillEpoch = sJob.source_epoch;
+            // Immutable source identity (design 7.1), captured at snapshot time.
+            sFillMediaEpoch = sJob.id.media_epoch;
+            sFillWriteEpoch = sJob.id.write_epoch;
+            sFillReqId = sJob.id.request_id;
+            sFillJobId = sJob.job_id;
+            sFillSnapshotId++;
+            // Only a write-backfill marks the entry as filling; an M4 probe must
+            // leave the already-valid entry untouched.
+            if (!wantProbe)
+                sState[sFillIdx] = 1;
+            sFillWaitSlot = sJob.slot;
+            sFillWaitVersion = sJob.slot_version;
+            sFillState = FILL_SNAPSHOT_READY;
+            sFillIsProbe = wantProbe ? 1 : 0;
+            if (wantProbe)
+                sL2HitAttempt++;
+        }
+        else if (want)
+        {
+            sFillDropReason = FILL_DROP_EXISTING;
+            sFillDefer++;
+        }
+    }
+
+    sDidPublish = 1;
+    sJobActive = 0;
+    sJobSdStarted = 0;
+    sJobUseFallback = 0;
+}
+
+static CACHE_RAM_CODE void jobStart(const cs_job* job)
+{
+    sJob = *job;
+    sJobActive = 1;
+    sJobSdStarted = 0;
+    sJobUseFallback = 0;
+    sJobOff = 0;
+    sJobL2Epoch = job->source_epoch;
+
+    uint32_t sector = job->id.sector;
+    uint32_t idx = cacheIdx(sector);
+    // M1/M2/M3 keep the demand on SD so the mode matrix is a real control
+    // variable. M4 VERIFIES entries against SD instead of serving them; only M5
+    // serves a verified hit. A degraded backend never serves a hit (section 11).
+    if (sEnabled && !sDegraded && sL2Mode == CACHE_L2_MODE_M5 && sState[idx] == 2 &&
+        sTagEpoch[idx] == sJobL2Epoch && sTag[idx] == sector)
+    {
+        sJobSrc = 1;
+        sJobL2Idx = idx;
+        sJobCrc = 0xFFFFFFFFu;
+        sHits++;
+        sL2HitAttempt++;
+        return;
+    }
+
+    sJobSrc = 0;
+    sMisses++;
+}
+
+static CACHE_RAM_CODE void jobStep(void)
+{
+    if (sJobSrc == 0)
+    {
+        if (!sJobSdStarted)
+        {
+            if (!sHw->sdBeginRead(jobBuf(), sJob.id.sector))
+                return; // SD engine busy; retry next step
+            sJobSdToken = sHw->sdTransferId();
+            sJobSdStarted = 1;
+            return;
+        }
+
+        // Superseded by another SD owner: our result is no longer identifiable.
+        // Distinguish a benign obsolete retirement from a live-owner conflict
+        // (design sections 2.2 and 9.1): the latter must be fixed, not excused.
+        if (sHw->sdTransferId() != sJobSdToken)
+        {
+            bool live = sCs.intent_valid && cs_identity_equal(&sJob.id, &sCs.intent);
+            if (live)
+            {
+                sSdTokenLiveConflict++;
+                noteFaultLocked(CS_FAULT_SD_TOKEN, 1);
+            }
+            else
+            {
+                sSdTokenObsolete++;
+            }
+            sErrors++;
+            jobFinish(CS_RES_CANCELLED);
+            return;
+        }
+        if (sHw->sdReady())
+        {
+            // SD completion must carry an error status, not just "Idle"
+            // (design section 11). A failed transfer is never published.
+            if (sHw->sdError())
+            {
+                sSdTransferError++;
+                sErrors++;
+                jobFinish(CS_RES_FAULT);
+                return;
+            }
+            publishVerified();
+        }
+        return;
+    }
+
+    // L2 hit read: chunked PSRAM -> staging, CRC checked against the directory.
+    uint32_t frag = CS_SECTOR_BYTES - sJobOff;
+    if (frag > PSRAM_CACHE_FRAG_BYTES)
+        frag = PSRAM_CACHE_FRAG_BYTES;
+    uint32_t chip = sJobL2Idx & 3u;
+    uint32_t base = (sJobL2Idx >> 2) * CS_SECTOR_BYTES + sJobOff;
+    uint8_t* dst = &sDemandStage[sJobOff];
+
+    if (!sHw->psramRead(chip, base, dst, frag))
+    {
+        // Bounded transport failure: degrade the L2 path, drop the entry and
+        // continue this demand over SD from a buffer the failed transport was
+        // never allowed to touch (design section 11).
+        sErrors++;
+        sPsramReadFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_PSRAM, sJob.id.sector);
+        cacheSdDegrade(CS_FAULT_PSRAM);
+        if (sState[sJobL2Idx] != 1)
+            sState[sJobL2Idx] = 0;
+        sJobSrc = 0;
+        sJobSdStarted = 0;
+        sJobUseFallback = 1;
+        return;
+    }
+
+    sJobCrc = crc32Update(sJobCrc, dst, frag);
+    sJobOff += frag;
+
+    if (sJobOff < CS_SECTOR_BYTES)
+        return;
+
+    sJobCrc ^= 0xFFFFFFFFu;
+    bool ok = (sState[sJobL2Idx] == 2) &&
+              sTagEpoch[sJobL2Idx] == sJobL2Epoch &&
+              sTag[sJobL2Idx] == sJob.id.sector &&
+              sJobCrc == sCrc[sJobL2Idx];
+    if (ok)
+    {
+        sL2HitVerified++;
+        publishVerified();
+        return;
+    }
+
+    // Corrupt/stale entry: drop it and retry the same request over SD once.
+    sErrors++;
+    sL2CrcFail++;
+    noteFaultLocked(CS_FAULT_L2_CRC, sJob.id.sector);
+    if (sState[sJobL2Idx] != 1)
+        sState[sJobL2Idx] = 0;
+    sJobSrc = 0;
+    sJobSdStarted = 0;
+    sJobUseFallback = 1;
+}
+
+// M4 READ_PROBE (design section 10): read the existing L2 entry in bounded
+// fragments into an independent probe buffer and compare the FULL 512 B against
+// the SD reference snapshot. The demand staging and the E5 response slot are
+// never touched. A media/write epoch change cancels the comparison instead of
+// reporting a legitimate update as a CRC error.
+static CACHE_RAM_CODE void probeStep(void)
+{
+    uint32_t frag = CS_SECTOR_BYTES - sFillOff;
+    if (frag > PSRAM_CACHE_FRAG_BYTES)
+        frag = PSRAM_CACHE_FRAG_BYTES;
+    uint32_t chip = sFillIdx & 3u;
+    uint32_t base = (sFillIdx >> 2) * CS_SECTOR_BYTES + sFillOff;
+
+    if (!sHw->psramRead(chip, base, sProbeChunk, frag))
+    {
+        sErrors++;
+        sPsramReadFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_PSRAM, sFillSector);
+        cacheSdDegrade(CS_FAULT_PSRAM);
+        if (sState[sFillIdx] == 1)
+            sState[sFillIdx] = 0;
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_DEGRADE;
+        sFillState = FILL_RETIRED;
+        return;
+    }
+
+    bool match = memcmp(sProbeChunk, &sFillStage[sFillOff], frag) == 0;
+    sFillOff += frag;
+    bool complete = (sFillOff >= CS_SECTOR_BYTES);
+    if (!match)
+        complete = true;
+    if (!complete)
+        return; // keep probing in bounded fragments
+
+    uint32_t save = sHw->irqSave();
+    bool epochOk = (sFillEpoch == sCacheEpoch) &&
+                   (sFillMediaEpoch == sCs.media_epoch) &&
+                   (sFillWriteEpoch == sCs.write_epoch);
+    if (match && epochOk)
+    {
+        sL2HitVerified++;
+    }
+    else if (match)
+    {
+        // Legitimate update during the probe: cancel, do not report CRC.
+        sFillDropReason = FILL_DROP_EPOCH;
+        sFillDrop++;
+    }
+    else
+    {
+        // Real content mismatch: refuse the entry and fall back to SD.
+        if (sState[sFillIdx] != 1)
+            sState[sFillIdx] = 0;
+        sL2CrcFail++;
+        sErrors++;
+        cs_note_fault(&sCs, CS_FAULT_L2_CRC, sFillSector);
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_SUPERSEDED;
+    }
+    sHw->irqRestore(save);
+    sFillIsProbe = 0;
+    sFillState = FILL_RETIRED;
+}
+
+static CACHE_RAM_CODE void fillStep(void)
+{
+    if (sFillIsProbe)
+    {
+        probeStep();
+        return;
+    }
+    uint32_t frag = CS_SECTOR_BYTES - sFillOff;
+    if (frag > PSRAM_CACHE_FRAG_BYTES)
+        frag = PSRAM_CACHE_FRAG_BYTES;
+    uint32_t chip = sFillIdx & 3u;
+    uint32_t base = (sFillIdx >> 2) * CS_SECTOR_BYTES + sFillOff;
+
+    if (!sHw->psramWrite(chip, base, &sFillStage[sFillOff], frag))
+    {
+        sErrors++;
+        sPsramFillFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_FILL, sFillSector);
+        // A failed transport cannot be assumed quiescent: quarantine the
+        // backend rather than reusing the fragment path (design 8.1/11).
+        cacheSdDegrade(CS_FAULT_FILL);
+        sFillState = FILL_QUARANTINED;
+        if (sState[sFillIdx] == 1)
+            sState[sFillIdx] = 0;
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_DEGRADE;
+        return;
+    }
+
+    sFillCrc = crc32Update(sFillCrc, &sFillStage[sFillOff], frag);
+    sFillOff += frag;
+
+    if (sFillOff < CS_SECTOR_BYTES)
+        return;
+
+    sFillCrc ^= 0xFFFFFFFFu;
+    sFillState = FILL_VERIFIED;
+
+    // Check and commit in one critical section: a write barrier arriving here
+    // must not produce a checked-old / committed-new entry (design 13.3/R2).
+    // The source identity captured at snapshot time must still match.
+    uint32_t save = sHw->irqSave();
+    if (sState[sFillIdx] == 1 && sFillEpoch == sCacheEpoch &&
+        sFillMediaEpoch == sCs.media_epoch &&
+        sFillWriteEpoch == sCs.write_epoch)
+    {
+        sTag[sFillIdx] = sFillSector;
+        sTagEpoch[sFillIdx] = sFillEpoch;
+        sCrc[sFillIdx] = sFillCrc;
+        sState[sFillIdx] = 2;
+        sFills++;
+        sFillCommit++;
+        sFillState = FILL_COMMITTED;
+    }
+    else
+    {
+        if (sState[sFillIdx] == 1)
+            sState[sFillIdx] = 0;
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_EPOCH;
+        sFillState = FILL_DROP;
+    }
+    sHw->irqRestore(save);
+    // Cleanup finished; the dedicated snapshot buffer is reusable.
+    sFillIsProbe = 0;
+    sFillState = FILL_RETIRED;
+}
+
+// A snapshot whose source response was retired without a completed send can
+// never be admitted; drop it (design section 7.3). Runs on the main loop.
+static CACHE_RAM_CODE void fillReconcile(void)
+{
+    if (sFillState != FILL_SNAPSHOT_READY)
+        return;
+    const cs_slot* sl = &sCs.slots[sFillWaitSlot];
+    if (sl->version == sFillWaitVersion &&
+        (sl->state == CS_SLOT_DMA || sl->state == CS_SLOT_READY))
+        return; // response still pending with the host
+    fillAbortReason(FILL_DROP_SUPERSEDED);
+    sFillDrop++;
+}
+
+CACHE_RAM_CODE cacheSdStepResult cacheSdStep(void)
+{
+    bool did = false;
+    sDidPublish = 0;
+    // Terminal backfill states are transient labels; the single bounded slot is
+    // reusable for the next task once the previous one is retired.
+    if (sFillState == FILL_RETIRED || sFillState == FILL_DROP ||
+        sFillState == FILL_COMMITTED || sFillState == FILL_QUARANTINED)
+        sFillState = FILL_NONE;
+    uint64_t t0 = sHw->nowUs();
+
+    // 1. Reclaim a finished DMA0 response. This is where a snapshot waiting on
+    //    the response's handover becomes admitted (design section 7.3).
+    {
+        uint32_t save = sHw->irqSave();
+        dmaReclaimLocked();
+        sHw->irqRestore(save);
+    }
+
+    // 2. Service the foreground demand first (E3/E4/E5 have priority over the
+    //    background fill); this also lets a demand replace a pending fill.
+    if (!sJobActive)
+    {
+        cs_job job;
+        uint32_t save = sHw->irqSave();
+        bool ok = cs_accept_intent(&sCs, &job);
+        if (ok)
+            job.source_epoch = sCacheEpoch; // immutable at accept time
+        sHw->irqRestore(save);
+        if (ok)
+        {
+            jobStart(&job);
+            did = true;
+        }
+    }
+
+    if (sJobActive)
+    {
+        jobStep();
+        did = true;
+    }
+
+    // 3. Reconcile a snapshot that can no longer be admitted.
+    fillReconcile();
+
+    // 4. Advance an admitted background transport only when this step did NOT
+    //    publish a demand, unless the M3 legacy contrast build explicitly asks
+    //    for the old behaviour. This is the decoupling of section 7.2. Work is
+    //    additionally bounded by the measured step budget (design 7.4).
+    bool overBudget = (sTStepMaxUs != 0) &&
+                      ((uint32_t)(sHw->nowUs() - t0) >= sTStepMaxUs);
+    // Prepared/acked responses remain foreground work after job completion.
+    // Recheck at every fragment, including fragments of an older fill.
+    bool foreground = sCs.intent_valid || sCs.completion_valid ||
+                      sCs.binding_valid || sCs.write_pending ||
+                      sHw->dma0Busy() || !sHw->cartIdle();
+    if ((!sDidPublish || FILL_LEGACY_PUBLISH) && !sJobActive &&
+        (!foreground || FILL_LEGACY_PUBLISH) && !overBudget &&
+        (sFillState == FILL_ADMITTED || sFillState == FILL_TRANSFERRING))
+    {
+        if (sFillState == FILL_ADMITTED && sTIdleAdmitUs != 0 && !sHw->cartIdle())
+        {
+            sFillDefer++;
+        }
+        else
+        {
+            sFillState = FILL_TRANSFERRING;
+            fillStep();
+            did = true;
+        }
+    }
+
+    if (sDidPublish)
+        return CACHE_SD_STEP_DEMAND_PUBLISHED;
+    return did ? CACHE_SD_STEP_WORKED : CACHE_SD_STEP_IDLE;
+}
+
+CACHE_RAM_CODE uint8_t* cacheSdSlotBuffer(uint8_t slot)
+{
+    return sSlotBuf[slot < CS_SLOT_COUNT ? slot : 0];
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+CACHE_RAM_CODE uint32_t cacheSdHits(void) { return sHits; }
+CACHE_RAM_CODE uint32_t cacheSdMisses(void) { return sMisses; }
+CACHE_RAM_CODE uint32_t cacheSdFills(void) { return sFills; }
+CACHE_RAM_CODE uint32_t cacheSdErrors(void) { return sErrors; }
+
+CACHE_RAM_CODE uint32_t cacheSdOfferId(void)
+{
+    return sCs.binding_valid ? sCs.binding.offer_id
+                             : (sCs.completion_valid ? sCs.completion.offer_id : 0);
+}
+
+CACHE_RAM_CODE uint32_t cacheSdAckedOfferId(void) { return sCs.acked_offer_id; }
+
+CACHE_RAM_CODE const cs_fault_record* cacheSdFirstFault(void) { return &sCs.first_fault; }
+
+CACHE_RAM_CODE void cacheSdGetCounters(cacheSdCounters* out)
+{
+    if (!out)
+        return;
+    out->sd_token_obsolete = sSdTokenObsolete;
+    out->sd_token_live_conflict = sSdTokenLiveConflict;
+    out->sd_transfer_error = sSdTransferError;
+    out->l2_hit_attempt = sL2HitAttempt;
+    out->l2_hit_verified = sL2HitVerified;
+    out->l2_crc_fail = sL2CrcFail;
+    out->psram_read_fail = sPsramReadFail;
+    out->psram_fill_fail = sPsramFillFail;
+    out->fill_admit = sFillAdmit;
+    out->fill_drop = sFillDrop;
+    out->fill_defer = sFillDefer;
+    out->fill_commit = sFillCommit;
+    out->fill_quarantine = sFillQuarantine;
+    out->fill_drop_reason = sFillDropReason;
+}
+
+CACHE_RAM_CODE uint32_t cacheSdSectors(void)
+{
+    uint32_t n = 0;
+    uint32_t ep = sCacheEpoch;
+    for (uint32_t i = 0; i < CACHE_SD_SECTORS; i++)
+        if (sState[i] == 2 && sTagEpoch[i] == ep)
+            n++;
+    return n;
+}
+
+CACHE_RAM_CODE const cs_state* cacheSdState(void)
+{
+    return &sCs;
+}
+
+#ifndef CACHE_SD_HOST
+// ---------------------------------------------------------------------------
+// Target adapter (real SD/PIO/DMA/IRQ). Declared here so the host build never
+// references the pico SDK.
+// ---------------------------------------------------------------------------
+static CACHE_RAM_CODE bool hwSdBeginRead(uint8_t* dst, uint32_t sector);
+static CACHE_RAM_CODE bool hwSdReady(void);
+static CACHE_RAM_CODE uint32_t hwSdTransferId(void);
+static CACHE_RAM_CODE bool hwPsramRead(uint32_t chip, uint32_t addr, void* buf, uint32_t len);
+static CACHE_RAM_CODE bool hwPsramWrite(uint32_t chip, uint32_t addr, const void* buf, uint32_t len);
+static CACHE_RAM_CODE bool hwDma0Busy(void);
+static CACHE_RAM_CODE bool hwCartIdle(void);
+static CACHE_RAM_CODE bool hwSdError(void);
+static CACHE_RAM_CODE uint32_t hwIrqSave(void);
+static CACHE_RAM_CODE void hwIrqRestore(uint32_t save);
+static CACHE_RAM_CODE uint64_t hwNowUs(void);
+
+CACHE_RAM_CODE const cacheSdHw* cacheSdDefaultHw(void);
+
+// The callbacks are also read while interrupts are masked; keep the table in
+// SRAM along with the callback code, not in Flash .rodata.
+static cacheSdHw sTargetHw = {
+    hwSdBeginRead, hwSdReady, hwSdTransferId,
+    hwPsramRead, hwPsramWrite,
+    hwDma0Busy, hwCartIdle, hwSdError,
+    hwIrqSave, hwIrqRestore, hwNowUs,
+};
+
+CACHE_RAM_CODE const cacheSdHw* cacheSdDefaultHw(void) { return &sTargetHw; }
+
+extern bool ntrc_cacheSdBegin(uint8_t* dst, uint32_t sector);
+extern bool ntrc_cacheSdReady(void);
+extern uint32_t ntrc_cacheSdTransferId(void);
+extern bool ntrc_cacheSdError(void);
+extern volatile uint32_t gCartSdRecoveryPending;
+
+static CACHE_RAM_CODE bool hwSdBeginRead(uint8_t* dst, uint32_t sector) { return ntrc_cacheSdBegin(dst, sector); }
+static CACHE_RAM_CODE bool hwSdReady(void) { return ntrc_cacheSdReady(); }
+static CACHE_RAM_CODE uint32_t hwSdTransferId(void) { return ntrc_cacheSdTransferId(); }
+static CACHE_RAM_CODE bool hwPsramRead(uint32_t chip, uint32_t addr, void* buf, uint32_t len) { return psramRead(chip, addr, buf, len); }
+static CACHE_RAM_CODE bool hwPsramWrite(uint32_t chip, uint32_t addr, const void* buf, uint32_t len) { return psramWrite(chip, addr, buf, len); }
+static CACHE_RAM_CODE bool hwDma0Busy(void) { return dma_channel_is_busy(0); }
+static CACHE_RAM_CODE bool hwCartIdle(void) { return !gCartSdRecoveryPending && gpio_get(PIN_CEB) && gpio_get(PIN_CS2); }
+static CACHE_RAM_CODE bool hwSdError(void) { return ntrc_cacheSdError(); }
+static CACHE_RAM_CODE uint32_t hwIrqSave(void) { return save_and_disable_interrupts(); }
+static CACHE_RAM_CODE void hwIrqRestore(uint32_t save) { restore_interrupts(save); }
+static CACHE_RAM_CODE uint64_t hwNowUs(void) { return time_us_64(); }
+#endif // !CACHE_SD_HOST
+
+#endif // CACHE_SD_ENABLED

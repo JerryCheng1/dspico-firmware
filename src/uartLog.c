@@ -15,7 +15,7 @@
 // Overridable from CMake (-DUART_LOG_BUILD_TAG=...) so each baseline build
 // prints a distinct tag on the boot banner; keep the r6 default untouched.
 #ifndef UART_LOG_BUILD_TAG
-#define UART_LOG_BUILD_TAG    "rp2354a-sdio-kick-psram-r6"
+#define UART_LOG_BUILD_TAG    "cache-send-r5"
 #endif
 
 _Static_assert((UART_LOG_RING_SIZE & (UART_LOG_RING_SIZE - 1u)) == 0,

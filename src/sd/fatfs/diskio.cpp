@@ -12,9 +12,18 @@
 #include "pico/stdlib.h"
 #include "ff.h"			/* Obtains integer types */
 #include "diskio.h"		/* Declarations of disk functions */
+#if CACHE_STAGE >= 3
+#include "../../cacheSd.h"
+#endif
 
 /* Definitions of physical drive number for each drive */
 #define DEV_SD		0
+
+#if CACHE_STAGE >= 3
+// Monotonic medium generation, bumped on every successful drive init.
+static u32 sDiskMediaGeneration = 0;
+static u32 diskMediaGeneration(void) { return ++sDiskMediaGeneration; }
+#endif
 
 /*-----------------------------------------------------------------------*/
 /* Get Drive Status                                                      */
@@ -45,6 +54,11 @@ extern "C" DSTATUS disk_initialize (
             {
                 return STA_NOINIT;
             }
+#if CACHE_STAGE >= 3
+            // Medium identity may have changed (re-init): invalidate every
+            // cached read so nothing from the previous medium can be served.
+            cacheSdSetMediaEpoch(diskMediaGeneration());
+#endif
             return 0;
         }
     }
@@ -66,12 +80,14 @@ extern "C" DRESULT __time_critical_func(disk_read) (
 {
     DRESULT res;
     int result;
+    (void)res;
+    (void)result;
 
     switch (pdrv)
     {
         case DEV_SD:
         {
-            while (!gSdCard.TryReadSectorsSync(buff, sector, count));
+            gSdCard.ReadSectorsBlocking(buff, sector, count);
             return RES_OK;
         }
     }
@@ -101,7 +117,16 @@ extern "C" DRESULT disk_write (
     {
         case DEV_SD:
         {
-            while (!gSdCard.TryWriteSectorsSync(buff, sector, count));
+#if CACHE_STAGE >= 3
+            // Every FatFs write funnels through here: register the write
+            // intent so no cached read can publish stale data afterwards. The
+            // barrier spans the whole synchronous write (design section 8.1).
+            u32 wtoken = cacheSdWriteBegin();
+#endif
+            gSdCard.WriteSectorsBlocking(buff, sector, count);
+#if CACHE_STAGE >= 3
+            cacheSdWriteEnd(wtoken);
+#endif
             return RES_OK;
         }
     }

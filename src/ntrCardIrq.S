@@ -155,10 +155,13 @@ ntrc_gameNoScrambleCmd0Handler:
 .balign 4
 .pool
 
-// Dispatch tables live in flash (.rodata): one 32-bit load per dispatch, and
-// the DLDI phase only ever touches the E3/E4/E5 cache line. scratch_y is for
-// code that must never miss - the r68 trace block overflowed it otherwise.
+// Stage 3 must not depend on an XIP cache hit before arming E4/E5. Use main
+// SRAM for both dispatch tables, leaving scratch_y for the dispatcher code.
+#if CACHE_STAGE >= 3
+.section .data.cache_dispatch, "aw"
+#else
 .section .rodata
+#endif
 //from 0xB0 to 0xFF
 .global gGameNoScrambleCmd0HandlerTable
 gGameNoScrambleCmd0HandlerTable:
@@ -276,7 +279,11 @@ ntrc_gameNoScrambleCmd1Handler:
 .balign 4
 .pool
 
+#if CACHE_STAGE >= 3
+.section .data.cache_dispatch, "aw"
+#else
 .section .rodata
+#endif
 //from 0xB0 to 0xFF
 .global gGameNoScrambleCmd1HandlerTable
 gGameNoScrambleCmd1HandlerTable:

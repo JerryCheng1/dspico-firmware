@@ -198,7 +198,7 @@ extern "C" void __time_critical_func(ntrc_gameNoScrambleReadPageCmd0)(ntr_rom_em
 
 static void initFileFromFatEntry(FIL* file, u32 fatEntryAddr, bool save)
 {
-    while (!gSdCard.TryReadSectorsSync(sR4RomBlock, fatEntryAddr >> 9, 1));
+    gSdCard.ReadSectorsBlocking(sR4RomBlock, fatEntryAddr >> 9, 1);
     const u8* fatEntry = &sR4RomBlock[fatEntryAddr & 0x1FF];
 
     u32 firstCluster = *(const u16*)&fatEntry[26];
