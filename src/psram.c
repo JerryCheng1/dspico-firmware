@@ -39,6 +39,9 @@ static int sDmaTx = -1;
 static int sDmaRx = -1;
 static bool sEngineReady = false;
 static volatile u32 sRuntimeState = PSRAM_STATE_NONE;
+#ifdef PSRAM_QUAL_FAULT_TEST
+static volatile u8 sQualFaultOnce;
+#endif
 
 // Isolated self-test block, above the 512 KiB/chip the sector cache uses.
 #define PSRAM_SELFTEST_ADDR (PSRAM_SIZE_BYTES - 128u)
@@ -379,6 +382,76 @@ bool psramSelfTest(void)
     return true;
 }
 
+#ifdef CACHE_PSRAM_BOOT_DIAG
+static psramCacheWindowDiag psramCacheWindowCompare(const u8 source[512], bool sioWrite)
+{
+    // Address zero is where a cached sector zero would live. M2 never serves
+    // or fills PSRAM, so this boot-only test cannot change game data.
+    static u8 pioData[512] __attribute__((aligned(4)));
+    static u8 sioData[512] __attribute__((aligned(4)));
+    psramCacheWindowDiag d = {0};
+    if (sRuntimeState < PSRAM_STATE_SELFTEST_OK || !source)
+        return d;
+    memset(pioData, 0, sizeof(pioData));
+    memset(sioData, 0, sizeof(sioData));
+
+    bool ok = true;
+    for (u32 off = 0; off < 512u; off += PSRAM_PIO_FRAG_BYTES)
+        if (!(sioWrite ? psramBitBangWrite(0, off, source + off, PSRAM_PIO_FRAG_BYTES)
+                       : psramWrite(0, off, source + off, PSRAM_PIO_FRAG_BYTES)))
+        { ok = false; break; }
+    if (!ok) return d;
+    d.flags |= 1u;
+
+    ok = true;
+    for (u32 off = 0; off < 512u; off += PSRAM_PIO_FRAG_BYTES)
+        if (!psramRead(0, off, pioData + off, PSRAM_PIO_FRAG_BYTES))
+        { ok = false; break; }
+    if (ok) d.flags |= 2u;
+
+    ok = psramBitBangRead(0, 0, sioData, sizeof(sioData));
+    if (ok) d.flags |= 4u;
+
+    if (d.flags & 2u)
+    {
+        d.pioOff = 512u;
+        for (u32 i = 0; i < 512u; i++)
+            if (pioData[i] != source[i]) { d.pioOff = i; break; }
+        if (d.pioOff == 512u) d.flags |= 8u;
+        else { d.expectedPio = source[d.pioOff]; d.actualPio = pioData[d.pioOff]; }
+    }
+    if (d.flags & 4u)
+    {
+        d.sioOff = 512u;
+        for (u32 i = 0; i < 512u; i++)
+            if (sioData[i] != source[i]) { d.sioOff = i; break; }
+        if (d.sioOff == 512u) d.flags |= 16u;
+        else { d.expectedSio = source[d.sioOff]; d.actualSio = sioData[d.sioOff]; }
+    }
+    return d;
+}
+
+psramCacheWindowDiag psramCacheWindowSelfTest(void)
+{
+    static u8 source[512] __attribute__((aligned(4)));
+    for (u32 i = 0; i < sizeof(source); i++)
+        source[i] = (u8)(0xA5u ^ (u8)(i * 37u) ^ (u8)(i >> 3));
+    return psramCacheWindowCompare(source, false);
+}
+
+#ifdef CACHE_PSRAM_SECTOR0_DIAG
+psramCacheWindowDiag psramCacheWindowDataTest(const u8 source[512])
+{
+    return psramCacheWindowCompare(source, false);
+}
+
+psramCacheWindowDiag psramCacheWindowSioWriteTest(const u8 source[512])
+{
+    return psramCacheWindowCompare(source, true);
+}
+#endif
+#endif
+
 void psramSetRuntimeEnabled(bool enabled)
 {
     if (enabled)
@@ -425,6 +498,38 @@ static void pioPrepare(uint entryOffset)
     pio_sm_exec(pio2, 0, pio_encode_jmp((uint)sPioOffset + entryOffset));
 }
 
+// Fault exits must restore a bus state from which the next chip can safely
+// start. Do not assume DMA completion means the PIO has finished its clocks.
+static void pioAbortTransfer(uint dmaChannel)
+{
+    pio_sm_set_enabled(pio2, 0, false);
+    psramDeselectAll();
+    muxToSio();
+    sio_hw->gpio_oe_clr = PSRAM_IO_MASK;
+    sio_hw->gpio_clr = PSRAM_SCLK_MASK;
+    sio_hw->gpio_oe_set = PSRAM_SCLK_MASK;
+    // Make the external bus idle before waiting for DMA cancellation. Even
+    // if that wait stalls, no chip remains selected or clocked.
+    dma_channel_abort(dmaChannel);
+    pio_sm_clear_fifos(pio2, 0);
+}
+
+#ifdef PSRAM_QUAL_FAULT_TEST
+void psramQualInjectFaultOnce(u8 fault) { sQualFaultOnce = fault; }
+
+bool psramQualBusIdle(void)
+{
+    return (sio_hw->gpio_out & PSRAM_CE_MASK) == PSRAM_CE_MASK &&
+           (sio_hw->gpio_in & PSRAM_CE_MASK) == PSRAM_CE_MASK &&
+           (sio_hw->gpio_oe & PSRAM_CE_MASK) == PSRAM_CE_MASK &&
+           !(sio_hw->gpio_out & PSRAM_SCLK_MASK) &&
+           !(sio_hw->gpio_oe & PSRAM_IO_MASK) &&
+           !sMuxIsPio && !(pio2->ctrl & 1u) &&
+           !dma_channel_is_busy((uint)sDmaTx) &&
+           !dma_channel_is_busy((uint)sDmaRx);
+}
+#endif
+
 static bool pioReadFragment(u32 chip, u32 addr, u8* buf, u32 len)
 {
     // The DMA moves whole 32-bit words, so a caller buffer that is unaligned
@@ -451,6 +556,12 @@ static bool pioReadFragment(u32 chip, u32 addr, u8* buf, u32 len)
 
     psramSelectChip(chip);
     dma_channel_start((uint)sDmaRx);
+#ifdef PSRAM_QUAL_FAULT_TEST
+    bool forceStall = sQualFaultOnce == PSRAM_QUAL_FAULT_RX_STALL;
+    if (forceStall)
+        sQualFaultOnce = 0;
+    if (!forceStall)
+#endif
     pio_sm_set_enabled(pio2, 0, true);
 
     u32 spin = 0;
@@ -459,10 +570,7 @@ static bool pioReadFragment(u32 chip, u32 addr, u8* buf, u32 len)
         if (++spin > PSRAM_XFER_SPIN_LIMIT)
         {
             // Bounded failure: never leave the engine enabled or CE# low.
-            pio_sm_set_enabled(pio2, 0, false);
-            dma_channel_abort((uint)sDmaRx);
-            psramDeselectAll();
-            pio_sm_clear_fifos(pio2, 0);
+            pioAbortTransfer((uint)sDmaRx);
             return false;
         }
         tight_loop_contents();
@@ -472,7 +580,6 @@ static bool pioReadFragment(u32 chip, u32 addr, u8* buf, u32 len)
     dma_channel_abort((uint)sDmaRx);
     psramDeselectAll();
     pio_sm_clear_fifos(pio2, 0);
-
     if (bounce)
         memcpy(buf, rxBounce, len);
     return true;
@@ -508,6 +615,13 @@ static bool pioWriteFragment(u32 chip, u32 addr, const u8* buf, u32 len)
 
     psramSelectChip(chip);
     dma_channel_start((uint)sDmaTx);
+#ifdef PSRAM_QUAL_FAULT_TEST
+    u8 injected = sQualFaultOnce;
+    if (injected == PSRAM_QUAL_FAULT_TX_STALL ||
+        injected == PSRAM_QUAL_FAULT_TX_AFTER_DMA)
+        sQualFaultOnce = 0;
+    if (injected != PSRAM_QUAL_FAULT_TX_STALL)
+#endif
     pio_sm_set_enabled(pio2, 0, true);
 
     u32 spin = 0;
@@ -515,14 +629,18 @@ static bool pioWriteFragment(u32 chip, u32 addr, const u8* buf, u32 len)
     {
         if (++spin > PSRAM_XFER_SPIN_LIMIT)
         {
-            pio_sm_set_enabled(pio2, 0, false);
-            dma_channel_abort((uint)sDmaTx);
-            psramDeselectAll();
-            pio_sm_clear_fifos(pio2, 0);
+            pioAbortTransfer((uint)sDmaTx);
             return false;
         }
         tight_loop_contents();
     }
+#ifdef PSRAM_QUAL_FAULT_TEST
+    if (injected == PSRAM_QUAL_FAULT_TX_AFTER_DMA)
+    {
+        pioAbortTransfer((uint)sDmaTx);
+        return false;
+    }
+#endif
     // DMA finished when the last word reached the FIFO; the PIO may still be
     // shifting it. Wait until the SM blocks on the write-data PULL with an
     // empty TX FIFO, which is the exact end of the last quad clock.
@@ -533,10 +651,7 @@ static bool pioWriteFragment(u32 chip, u32 addr, const u8* buf, u32 len)
     {
         if (++spin > PSRAM_XFER_SPIN_LIMIT)
         {
-            pio_sm_set_enabled(pio2, 0, false);
-            dma_channel_abort((uint)sDmaTx);
-            psramDeselectAll();
-            pio_sm_clear_fifos(pio2, 0);
+            pioAbortTransfer((uint)sDmaTx);
             return false;
         }
         tight_loop_contents();
@@ -616,18 +731,31 @@ static bool psramAccess(u32 chip, u32 addr, void* buf, u32 len, bool write, bool
 {
     if (chip >= PSRAM_CHIP_COUNT)
         return false;
-    if ((addr + len) > PSRAM_SIZE_BYTES)
+    if (addr > PSRAM_SIZE_BYTES || len > PSRAM_SIZE_BYTES - addr)
         return false;
 
     u8* p = (u8*)buf;
     while (len > 0)
     {
-        u32 fragSize = forceBitBang ? PSRAM_BB_FRAG_BYTES : PSRAM_PIO_FRAG_BYTES;
+        bool usePio = !forceBitBang && gPsramUsePio && sEngineReady;
+        u32 fragSize = usePio ? PSRAM_PIO_FRAG_BYTES : PSRAM_BB_FRAG_BYTES;
         u32 frag = fragSize - (addr & (fragSize - 1u));
         if (frag > len)
             frag = len;
 
-        if (forceBitBang || !gPsramUsePio || !sEngineReady)
+        // The PIO engine transfers whole 32-bit words. An incomplete word
+        // would leave a read DMA waiting for an autopush, or write padding
+        // bytes beyond the requested range. Transfer complete words with PIO
+        // and leave fewer than four bytes for a bounded SIO transaction.
+        if (usePio && (frag & 3u) != 0u)
+        {
+            u32 whole = frag & ~3u;
+            if (whole > 0)
+                frag = whole;
+            else
+                usePio = false;
+        }
+        if (!usePio)
         {
             if (write)
                 bbQuadWriteFragment(chip, addr, p, frag);

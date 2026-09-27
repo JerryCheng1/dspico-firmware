@@ -8,6 +8,9 @@
 #include <stdarg.h>
 #ifdef CACHE_WATCH_LOG
 #include "cacheDiagLog.h"
+#ifdef CACHE_SUMMARY_LOG
+#include "cachePageMap.h"
+#endif
 #endif
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
@@ -59,6 +62,9 @@ static u32 sProgramOffset;
 FATFS sFatFs;
 SdCard gSdCard;
 static bool sIsSdCardMounted;
+#if CACHE_STAGE >= 3
+static bool sPsramPinsInitialized;
+#endif
 
 #ifdef CACHE_WATCH_LOG
 // Core0 writes only these markers; core1 owns the runtime UART in this build.
@@ -95,6 +101,58 @@ static void cacheWatchClockInit(void)
     systick_hw->csr = M33_SYST_CSR_TICKINT_BITS | M33_SYST_CSR_ENABLE_BITS;
 }
 
+#ifdef CACHE_SUMMARY_LOG
+static void cacheSummaryPoll(void)
+{
+    static cacheWatchGate gate;
+    static cacheTextStream stream;
+    static cacheSdCounters counters;
+    static u32 lastUs, lastUsed, lastHit, lastOther, lastCapacity;
+    static bool reported;
+    if (!sWatchReady) return;
+    u32 now = time_us_32();
+    if (!cacheWatchGateWarm(&gate, now)) return;
+    const volatile cs_state* cs = cacheSdState();
+    const volatile cacheSdTxSnapshot* tx = cacheSdLastTx();
+    const u32 activity[7] = {gNtrRomEmu.cmd0, gNtrRomEmu.cmd1,
+        (u32)gNtrRomEmu.wordIdx, cs->c_e4_busy, cs->c_e4_ready_queued,
+        tx->sends, cs->write_epoch};
+    bool available = gpio_get(PIN_CEB) && gpio_get(PIN_CS2) &&
+        (!gComputeScrambler || SCR_RING_WRAP(gScramblerRingWPtr + 1) ==
+                               gNtrRomEmu.scrRingRPtr);
+    if (!cacheWatchGateIdle(&gate, now, available, activity)) return;
+    if (stream.format)
+    {
+        for (unsigned n = 0; n < 16; n++)
+        {
+            if (!gpio_get(PIN_CEB) || !gpio_get(PIN_CS2) ||
+                (gComputeScrambler && SCR_RING_WRAP(gScramblerRingWPtr + 1) !=
+                                      gNtrRomEmu.scrRingRPtr) ||
+                !uart_is_writable(uart1)) return;
+            int ch = cacheTextNext(&stream);
+            if (ch < 0) break;
+            uart_putc_raw(uart1, (char)ch);
+        }
+        return;
+    }
+    if (reported && (u32)(now - lastUs) < 5000000u) return;
+    cacheSdGetCounters(&counters);
+    u32 mask = sWatchL2 ? psramChipReadyMask() & 0xFu : 0u;
+    u32 capacity = (u32)__builtin_popcount(mask) *
+        CACHE_PAGE_ACTIVE_SETS * CACHE_PAGE_DATA_BYTES;
+    if (reported && capacity == lastCapacity &&
+        counters.page_valid_sectors == lastUsed &&
+        counters.demand_hit_ok == lastHit &&
+        counters.demand_non_psram_ok == lastOther) return;
+    lastUs = now;
+    lastCapacity = capacity;
+    lastUsed = counters.page_valid_sectors;
+    lastHit = counters.demand_hit_ok;
+    lastOther = counters.demand_non_psram_ok;
+    reported = true;
+    cacheSummaryStartLine(&stream, capacity, &counters);
+}
+#else
 static void cacheWatchPoll(void)
 {
     static u32 lastUs, sample, blockedUs;
@@ -186,7 +244,14 @@ static void cacheWatchPoll(void)
         }
         return;
     }
-    if (part < 4)
+#if defined(CACHE_SHADOW_STRIPES_4CHIP) || defined(CACHE_FULL_PAGE_4CHIP)
+    constexpr unsigned kCacheWatchDetailLines = 6;
+#elif defined(CACHE_PROBE_MISMATCH_DIAG)
+    constexpr unsigned kCacheWatchDetailLines = 5;
+#else
+    constexpr unsigned kCacheWatchDetailLines = 4;
+#endif
+    if (part < kCacheWatchDetailLines)
     {
         cacheDiagStartLine(&stream, part++, sample, &counters);
         return;
@@ -280,13 +345,18 @@ static void cacheWatchPoll(void)
         "\n", field);
     part = 0;
 }
+#endif
 
 static void __scratch_x("cpu1") cacheWatchIdle(void)
 {
     if (sWatchTick)
     {
         sWatchTick = false;
+#ifdef CACHE_SUMMARY_LOG
+        cacheSummaryPoll();
+#else
         cacheWatchPoll();
+#endif
     }
     // Also wakes immediately on the existing scrambler-consumer SEV.
     __wfe();
@@ -509,7 +579,7 @@ static void initSd(void)
     {
         FRESULT mountResult = f_mount(&sFatFs, "0:", 1);
         lastResult = (int)mountResult;
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
         uartLogPrintfBlocking("[sd] f_mount try %d -> %d\n", i, (int)mountResult);
 #endif
         if (mountResult == FR_OK)
@@ -550,9 +620,15 @@ static void tryRebootToBootsel(void)
 
 static inline void earlyGpioInit(void)
 {
-    // Set all GPIOs to inputs.
+    // PSRAM was configured and self-tested before this function. Preserve its
+    // mux, direction and chip-select levels while resetting the other pins.
     // Note that we rely on hardware reset having enabled pull-downs.
-    gpio_init_mask(0xFFFFFFFFu);
+    uint32_t gpioInitMask = 0xFFFFFFFFu;
+#if CACHE_STAGE >= 3
+    if (sPsramPinsInitialized)
+        gpioInitMask &= ~PSRAM_PIN_MASK;
+#endif
+    gpio_init_mask(gpioInitMask);
 
     // Set NTRCARD IRQ pin low.
     // This needs to happen immediately.
@@ -637,6 +713,10 @@ static inline void earlyGpioInit(void)
     // Disable all unused GPIO inputs. Saves a little power.
 #if 1
     uint32_t usedPins = NTRC_PIN_MASK | SDIO_PIN_MASK | DEV_UART_PIN_MASK;
+#if CACHE_STAGE >= 3
+    if (sPsramPinsInitialized)
+        usedPins |= PSRAM_PIN_MASK;
+#endif
     for(uint32_t i = 0; i < NUM_BANK0_GPIOS; i++)
     {
         if(!(usedPins & 1u))
@@ -703,7 +783,7 @@ int __time_critical_func(main)()
         l2Mode = CACHE_L2_MODE_M0;
 #endif
         cacheSdSetMode(l2Mode);
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
         uartLogPrintf("[cache-boot] start mode=M%u\n", (unsigned)l2Mode);
         uartLogFlush();
 #endif
@@ -716,6 +796,7 @@ int __time_critical_func(main)()
         else
         {
             psramGpioInit();
+            sPsramPinsInitialized = true;
             bool res = psramEngineInit();
             if (res)
                 psramSetClockDiv(PSRAM_PIO_CLKDIV);
@@ -725,8 +806,26 @@ int __time_critical_func(main)()
             // M1/M2 never touch the data path, so DEVICE_READY is enough for
             // them; M3+ starts PSRAM writes/reads and therefore requires the
             // self-test to have verified an isolated block.
-            if (dev && l2Mode >= CACHE_L2_MODE_M3)
+            if (dev && (l2Mode >= CACHE_L2_MODE_M3
+#ifdef CACHE_PSRAM_BOOT_DIAG
+                        || l2Mode == CACHE_L2_MODE_M2
+#endif
+                       ))
                 selftest = psramSelfTest();
+#ifdef CACHE_PSRAM_BOOT_DIAG
+            psramCacheWindowDiag lowDiag = {};
+            if (selftest)
+                lowDiag = psramCacheWindowSelfTest();
+#ifdef ENABLE_UART_LOG
+            uartLogPrintf("[psram-low] flags=%02lX pioOff=%lu pio=%02X/%02X sioOff=%lu sio=%02X/%02X\n",
+                          (unsigned long)lowDiag.flags,
+                          (unsigned long)lowDiag.pioOff,
+                          (unsigned)lowDiag.expectedPio, (unsigned)lowDiag.actualPio,
+                          (unsigned long)lowDiag.sioOff,
+                          (unsigned)lowDiag.expectedSio, (unsigned)lowDiag.actualSio);
+            uartLogFlush();
+#endif
+#endif
             enabled = (l2Mode <= CACHE_L2_MODE_M2) ? dev : selftest;
             if (enabled)
                 psramSetRuntimeEnabled(true);
@@ -735,7 +834,7 @@ int __time_critical_func(main)()
 #ifdef CACHE_WATCH_LOG
         sWatchL2 = enabled;
 #endif
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
         uartLogPrintf("[cache-boot] mode=M%u enabled=%u state=%u mask=%02lX\n",
                       (unsigned)l2Mode, (unsigned)enabled,
                       (unsigned)psramGetRuntimeState(), (unsigned long)devMask);
@@ -837,7 +936,7 @@ int __time_critical_func(main)()
     sIsSdCardMounted = false;
     initSd();
 
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
     // Print the mount result BEFORE tryRebootToBootsel can halt the main loop,
     // so a f_mount failure is distinguishable from a DLDI E3/E4/E5 failure.
     uartLogPrintf("[sd] f_mount=%s\n", sIsSdCardMounted ? "OK" : "FAIL");

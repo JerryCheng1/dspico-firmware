@@ -2,6 +2,9 @@
 
 #if CACHE_SD_ENABLED
 #include <string.h>
+#ifdef CACHE_FULL_PAGE_4CHIP
+#include "cachePageStore.h"
+#endif
 
 #ifndef CACHE_SD_HOST
 #include "common.h"
@@ -20,10 +23,27 @@ CACHE_RAM_CODE const cacheSdHw* cacheSdDefaultHw(void);
 //   source_epoch  captured at job accept time; a fill inherits it and never
 //                 reads "the current epoch" as a substitute (design 13.3/R2).
 // ---------------------------------------------------------------------------
+#ifdef CACHE_FULL_PAGE_4CHIP
+static cachePageStore sPageStore;
+static cachePageTask sDemandPageTask, sFillPageTask;
+static volatile uint32_t sPageFill[4], sPageProbe[4], sPageHitOk[4], sPageMaxSet[4];
+#else
 static uint32_t sTag[CACHE_SD_SECTORS];
 static uint32_t sTagEpoch[CACHE_SD_SECTORS];
 static uint32_t sCrc[CACHE_SD_SECTORS];
 static uint8_t sState[CACHE_SD_SECTORS];   // 0 empty, 1 filling, 2 ready
+#endif
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+// Diagnostic address extension: each chip owns 16 x 512 KiB stripes. A
+// directory index keeps its 512 B position within a stripe; each newly
+// admitted fill rotates to the next stripe of that chip. The game still uses
+// SD for every demand. This is coverage instrumentation, not the final 4 KiB
+// allocator from design section 4.3.
+static uint8_t sStripe[CACHE_SD_SECTORS];
+static uint8_t sNextStripe[4];
+static uint8_t sFillStripe;
+static volatile uint32_t sShadowBanks[4], sShadowVerify[4];
+#endif
 static uint32_t sCrcTab[256];
 static volatile uint32_t sCacheEpoch = 1;
 
@@ -34,6 +54,13 @@ static uint8_t sSlotBuf[CS_SLOT_COUNT][CS_SECTOR_BYTES] __attribute__((aligned(4
 // is copied into the response slot (and the backfill snapshot) only after
 // verification, so the SD DMA destination is never the published response.
 static uint8_t sDemandStage[CS_SECTOR_BYTES] __attribute__((aligned(4)));
+#ifdef CACHE_BOOT_SECTOR0_SEED
+// The legacy prewarm buffer is outside stage 3's demand/response lifecycle.
+// Keep a separate copy: another sector may be requested before sector 0.
+static uint8_t sBootSector0[CS_SECTOR_BYTES] __attribute__((aligned(4)));
+static uint8_t sBootSector0Valid;
+static volatile uint32_t sBootSeedUse;
+#endif
 
 // Independent SD fallback buffer (design section 11). If a PSRAM read failed,
 // the demand may only continue from a buffer the failed transport was never
@@ -51,6 +78,9 @@ static bool sEnabled;
 #define CACHE_L2_MODE 5
 #endif
 static uint8_t sL2Mode = (uint8_t)CACHE_L2_MODE;
+#ifdef CACHE_M4_PROMOTE_M5_AFTER_PROBES
+static uint8_t sM4Promoted;
+#endif
 
 // L2 data path degraded (design section 11): no new hit/fill admission, the
 // already-published SRAM responses are kept and SD service continues.
@@ -59,12 +89,14 @@ static uint8_t sDegraded;
 // Demand job (single, main-loop owned).
 static cs_job sJob;
 static uint8_t sJobActive;
-static uint8_t sJobSrc;       // 0 = SD, 1 = L2
+static uint8_t sJobSrc;       // 0 = SD, 1 = L2, 2 = boot sector-0 seed
 static uint8_t sJobSdStarted;
 static uint8_t sJobUseFallback;
 static uint32_t sJobOff;
+#ifndef CACHE_FULL_PAGE_4CHIP
 static uint32_t sJobCrc;
 static uint32_t sJobL2Idx;
+#endif
 static uint32_t sJobL2Epoch;
 static uint32_t sJobSdToken;
 
@@ -111,7 +143,9 @@ enum
 
 static uint8_t sFillState;
 static uint8_t sFillIsProbe; // M4 READ_PROBE: verify the entry instead of writing it
+#ifndef CACHE_FULL_PAGE_4CHIP
 static uint8_t sProbeChunk[PSRAM_CACHE_FRAG_BYTES]; // independent probe buffer
+#endif
 static uint8_t sFillDropReason;
 static uint8_t sFillWaitSlot;
 static uint32_t sFillWaitVersion;
@@ -139,7 +173,30 @@ static volatile uint32_t sSdTokenObsolete, sSdTokenLiveConflict, sSdTransferErro
 static volatile uint32_t sL2HitAttempt, sL2HitVerified, sL2CrcFail;
 static volatile uint32_t sPsramReadFail, sPsramFillFail;
 static volatile uint32_t sFillAdmit, sFillDrop, sFillDefer, sFillCommit, sFillQuarantine;
-static volatile uint32_t sDemandHitOk, sProbeTry, sProbeOk, sReadBytes, sWriteBytes;
+static volatile uint32_t sDemandHitOk, sDemandNonPsramOk, sProbeTry, sProbeOk, sReadBytes, sWriteBytes;
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+static volatile uint32_t sProbeFirstValid, sProbeFirstSector, sProbeFirstOffset;
+static volatile uint32_t sProbeFirstExpected, sProbeFirstActual;
+static volatile uint32_t sProbeFirstRefCrc, sProbeFirstTagCrc;
+#endif
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+#define CACHE_FILL_QUIET_US 1000u
+static volatile uint32_t sLastHostCommandUs;
+static volatile uint32_t sHostCommandSeq;
+static uint32_t sLastQuietFragmentUs;
+static volatile uint32_t sQuietFillFragments, sQuietFillMaxUs;
+static volatile uint32_t sQuietFragmentActive, sQuietIrqOverlap, sQuietE5Overlap;
+static inline CACHE_RAM_CODE uint32_t hostCommandNow32(void)
+{
+#ifdef CACHE_SD_HOST
+    return (uint32_t)sHw->nowUs();
+#else
+    // One timer register read in the command IRQ. The 64-bit SDK helper is
+    // unnecessary for a one-millisecond guard and costs more IRQ cycles.
+    return time_us_32();
+#endif
+}
+#endif
 #if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
 static volatile uint32_t sGateChecks, sGateBlocked, sGateMask;
 static uint32_t sGatePhase;
@@ -185,6 +242,26 @@ static uint32_t sTIdleAdmitUs = CACHE_T_IDLE_ADMIT_US;
 // ---------------------------------------------------------------------------
 
 static inline CACHE_RAM_CODE uint32_t cacheIdx(uint32_t sector) { return sector & (CACHE_SD_SECTORS - 1u); }
+
+#ifndef CACHE_FULL_PAGE_4CHIP
+static inline CACHE_RAM_CODE uint32_t cacheAddr(uint32_t idx, uint32_t off)
+{
+    uint32_t base = (idx >> 2) * CS_SECTOR_BYTES + off;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    base += (uint32_t)sStripe[idx] * 0x80000u;
+#endif
+    return base;
+}
+
+static inline CACHE_RAM_CODE uint32_t fillAddr(uint32_t off)
+{
+    uint32_t base = (sFillIdx >> 2) * CS_SECTOR_BYTES + off;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    base += (uint32_t)sFillStripe * 0x80000u;
+#endif
+    return base;
+}
+#endif
 
 // Buffer currently holding the demand payload (fallback after a PSRAM fault).
 static inline CACHE_RAM_CODE uint8_t* jobBuf(void)
@@ -242,6 +319,16 @@ CACHE_RAM_CODE void cacheSdSetTimeBudgets(uint32_t step_us, uint32_t fragment_us
 
 CACHE_RAM_CODE void cacheSdInit(void)
 {
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    memset(sStripe, 0, sizeof(sStripe));
+    memset(sNextStripe, 0, sizeof(sNextStripe));
+    memset((void*)sShadowBanks, 0, sizeof(sShadowBanks));
+    memset((void*)sShadowVerify, 0, sizeof(sShadowVerify));
+    sFillStripe = 0;
+#endif
+#ifdef CACHE_M4_PROMOTE_M5_AFTER_PROBES
+    sM4Promoted = 0;
+#endif
     for (uint32_t i = 0; i < 256; i++)
     {
         uint32_t c = i;
@@ -253,11 +340,25 @@ CACHE_RAM_CODE void cacheSdInit(void)
     if (!sHw)
         sHw = cacheSdDefaultHw();
 #endif
+#ifdef CACHE_FULL_PAGE_4CHIP
+    cachePageStoreInit(&sPageStore, 0x0fu);
+    memset(&sDemandPageTask, 0, sizeof(sDemandPageTask));
+    memset(&sFillPageTask, 0, sizeof(sFillPageTask));
+    memset((void*)sPageFill, 0, sizeof(sPageFill));
+    memset((void*)sPageProbe, 0, sizeof(sPageProbe));
+    memset((void*)sPageHitOk, 0, sizeof(sPageHitOk));
+    memset((void*)sPageMaxSet, 0, sizeof(sPageMaxSet));
+#else
     memset(sState, 0, sizeof(sState));
     memset(sTagEpoch, 0, sizeof(sTagEpoch));
+#endif
     sCacheEpoch = 1;
     cs_init(&sCs);
     sJobActive = 0;
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    sBootSector0Valid = 0;
+    sBootSeedUse = 0;
+#endif
     sJobUseFallback = 0;
     sFillState = FILL_NONE;
     sFillIsProbe = 0;
@@ -274,12 +375,38 @@ CACHE_RAM_CODE void cacheSdInit(void)
     sL2HitAttempt = sL2HitVerified = sL2CrcFail = 0;
     sPsramReadFail = sPsramFillFail = 0;
     sFillAdmit = sFillDrop = sFillDefer = sFillCommit = sFillQuarantine = 0;
-    sDemandHitOk = sProbeTry = sProbeOk = sReadBytes = sWriteBytes = 0;
+    sDemandHitOk = sDemandNonPsramOk = sProbeTry = sProbeOk = sReadBytes = sWriteBytes = 0;
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+    sProbeFirstValid = sProbeFirstSector = sProbeFirstOffset = 0;
+    sProbeFirstExpected = sProbeFirstActual = 0;
+    sProbeFirstRefCrc = sProbeFirstTagCrc = 0;
+#endif
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    sLastHostCommandUs = hostCommandNow32();
+    sHostCommandSeq = 0;
+    sLastQuietFragmentUs = sLastHostCommandUs;
+    sQuietFillFragments = sQuietFillMaxUs = 0;
+    sQuietFragmentActive = sQuietIrqOverlap = sQuietE5Overlap = 0;
+#endif
 #if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
     sGateChecks = sGateBlocked = sGateMask = 0;
     sGatePhase = 0;
 #endif
     sEnabled = false;
+}
+
+CACHE_RAM_CODE void cacheSdSeedBootSector0(const uint8_t* data)
+{
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    if (!data)
+        return;
+    // Called before the cartridge can issue E3. Do not publish a response:
+    // the normal intent/job/slot identity checks remain authoritative.
+    memcpy(sBootSector0, data, CS_SECTOR_BYTES);
+    sBootSector0Valid = 1;
+#else
+    (void)data;
+#endif
 }
 
 CACHE_RAM_CODE void cacheSdSetEnabled(bool enabled)
@@ -288,7 +415,37 @@ CACHE_RAM_CODE void cacheSdSetEnabled(bool enabled)
     refreshFastReady();
 }
 
-CACHE_RAM_CODE void cacheSdSetMode(uint8_t mode) { sL2Mode = mode; }
+CACHE_RAM_CODE void cacheSdNoteHostCommandFromIrq(uint8_t kind)
+{
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    // A single 32-bit store in the command IRQ. The timer wraps safely under
+    // unsigned subtraction; this is a guard, not a future idle guarantee.
+    sLastHostCommandUs = hostCommandNow32();
+    sHostCommandSeq++;
+    if (sQuietFragmentActive)
+    {
+        sQuietIrqOverlap++;
+        if (kind == CACHE_HOST_CMD_E5) sQuietE5Overlap++;
+    }
+#else
+    (void)kind;
+#endif
+}
+
+CACHE_RAM_CODE void cacheSdSetMode(uint8_t mode)
+{
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    // A shadow build can never be switched to PSRAM demand service.
+    if (mode > CACHE_L2_MODE_M4) mode = CACHE_L2_MODE_M4;
+#endif
+#if defined(CACHE_FULL_PAGE_4CHIP) && !defined(CACHE_PAGE_M5_EXPERIMENT)
+    if (mode > CACHE_L2_MODE_M4) mode = CACHE_L2_MODE_M4;
+#endif
+    sL2Mode = mode;
+#ifdef CACHE_M4_PROMOTE_M5_AFTER_PROBES
+    sM4Promoted = 0;
+#endif
+}
 CACHE_RAM_CODE uint8_t cacheSdMode(void) { return sL2Mode; }
 
 CACHE_RAM_CODE void cacheSdDegrade(uint32_t reason)
@@ -496,6 +653,9 @@ CACHE_RAM_CODE bool cacheSdConsume(uint32_t* sector, uint8_t* slot, uint32_t* sl
 CACHE_RAM_CODE uint32_t cacheSdWriteBegin(void)
 {
     uint32_t save = sHw->irqSave();
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    sBootSector0Valid = 0;
+#endif
     uint32_t before = sCs.write_epoch;
     uint32_t token = cs_write_begin(&sCs);
     if (sCs.write_epoch != before)
@@ -504,6 +664,11 @@ CACHE_RAM_CODE uint32_t cacheSdWriteBegin(void)
         if (e == 0)
             e = 1;
         sCacheEpoch = e;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+        // Coverage belongs to one authoritative SD write generation.
+        for (uint32_t chip = 0; chip < 4u; chip++)
+            sShadowBanks[chip] = sShadowVerify[chip] = 0;
+#endif
     }
     refreshFastReady();
     sHw->irqRestore(save);
@@ -529,6 +694,9 @@ CACHE_RAM_CODE void cacheSdResetCart(void)
 CACHE_RAM_CODE void cacheSdSetMediaEpoch(uint32_t media_epoch)
 {
     uint32_t save = sHw->irqSave();
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    sBootSector0Valid = 0;
+#endif
     cs_set_media_epoch(&sCs, media_epoch);
     // Medium identity changed: any cached sector may belong to the previous
     // medium, so advance the namespace and let entries be re-matched by a new
@@ -537,6 +705,10 @@ CACHE_RAM_CODE void cacheSdSetMediaEpoch(uint32_t media_epoch)
     if (e == 0)
         e = 1;
     sCacheEpoch = e;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    for (uint32_t chip = 0; chip < 4u; chip++)
+        sShadowBanks[chip] = sShadowVerify[chip] = 0;
+#endif
     refreshFastReady();
     sHw->irqRestore(save);
 }
@@ -560,6 +732,9 @@ static CACHE_RAM_CODE void noteFaultLocked(uint8_t kind, uint32_t detail)
 static CACHE_RAM_CODE void jobFinish(uint8_t result)
 {
     (void)result;
+#ifdef CACHE_FULL_PAGE_4CHIP
+    cachePageStoreCancel(&sPageStore, &sDemandPageTask);
+#endif
     uint32_t save = sHw->irqSave();
     cs_job_requeue(&sCs, &sJob);
     refreshFastReady();
@@ -573,8 +748,12 @@ static CACHE_RAM_CODE void fillAbortReason(uint8_t reason)
 {
     if (sFillState == FILL_NONE)
         return;
+#ifdef CACHE_FULL_PAGE_4CHIP
+    cachePageStoreCancel(&sPageStore, &sFillPageTask);
+#else
     if (sState[sFillIdx] == 1)
         sState[sFillIdx] = 0;
+#endif
     sFillDropReason = reason;
     sFillIsProbe = 0;
     sFillState = FILL_DROP;
@@ -607,7 +786,7 @@ static CACHE_RAM_CODE void fillAdmitLocked(void)
 // commit it, then take an independent backfill snapshot. The snapshot's
 // transport is NOT started here; admission waits for the published response's
 // E5/DMA0 transfer to end (design sections 7.2/7.3, H1 isolation).
-static CACHE_RAM_CODE void publishVerified(void)
+static CACHE_RAM_CODE bool publishVerified(void)
 {
     memcpy(sSlotBuf[sJob.slot], jobBuf(), CS_SECTOR_BYTES);
 
@@ -624,9 +803,58 @@ static CACHE_RAM_CODE void publishVerified(void)
     refreshFastReady();
     sHw->irqRestore(save);
 
+    if (committed && sJobSrc == 0)
+        sDemandNonPsramOk++;
+
     if (committed && sEnabled && !sDegraded && sJobSrc == 0 &&
-        sL2Mode >= CACHE_L2_MODE_M2)
+        sL2Mode >= CACHE_L2_MODE_M2
+#if defined(CACHE_M4_PROMOTE_M5_AFTER_PROBES) && !defined(CACHE_M5_QUIET_FILL_AFTER_PROMOTION)
+        // The promotion trial serves only M4-warmed entries. A fresh M5 miss
+        // must not pin the sole snapshot buffer behind its stricter idle gate
+        // or invalidate a ready entry merely to queue an unfinishable refill.
+        && !sM4Promoted
+#endif
+        )
     {
+#ifdef CACHE_FULL_PAGE_4CHIP
+        if (sFillState == FILL_NONE)
+        {
+            memcpy(sFillStage, jobBuf(), CS_SECTOR_BYTES);
+            sFillSector = sJob.id.sector;
+            sFillIdx = cacheIdx(sFillSector);
+            sFillOff = 0;
+            sFillCrc = 0xFFFFFFFFu;
+            sFillEpoch = sJob.source_epoch;
+            sFillMediaEpoch = sJob.id.media_epoch;
+            sFillWriteEpoch = sJob.id.write_epoch;
+            sFillReqId = sJob.id.request_id;
+            sFillJobId = sJob.job_id;
+            sFillSnapshotId++;
+            bool probe = sL2Mode == CACHE_L2_MODE_M4 &&
+                         cachePageStoreBeginProbe(&sPageStore, &sFillPageTask,
+                             sFillSector, sFillEpoch, sFillStage);
+            bool started = probe || cachePageStoreBeginFill(&sPageStore,
+                &sFillPageTask, sFillSector, sFillEpoch, sFillStage);
+            if (started)
+            {
+                sFillIsProbe = probe ? 1u : 0u;
+                sFillWaitSlot = sJob.slot;
+                sFillWaitVersion = sJob.slot_version;
+                sFillState = FILL_SNAPSHOT_READY;
+                if (probe) { sL2HitAttempt++; sProbeTry++; }
+            }
+            else
+            {
+                sFillDropReason = FILL_DROP_NO_SLOT;
+                sFillDefer++;
+            }
+        }
+        else
+        {
+            sFillDropReason = FILL_DROP_EXISTING;
+            sFillDefer++;
+        }
+#else
         uint32_t pidx = cacheIdx(sJob.id.sector);
         bool haveEntry = (sState[pidx] == 2 && sTagEpoch[pidx] == sJob.source_epoch &&
                           sTag[pidx] == sJob.id.sector);
@@ -641,6 +869,16 @@ static CACHE_RAM_CODE void publishVerified(void)
             memcpy(sFillStage, jobBuf(), CS_SECTOR_BYTES);
             sFillSector = sJob.id.sector;
             sFillIdx = cacheIdx(sJob.id.sector);
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+            if (wantProbe)
+                sFillStripe = sStripe[sFillIdx];
+            else
+            {
+                uint32_t chip = sFillIdx & 3u;
+                sFillStripe = sNextStripe[chip];
+                sNextStripe[chip] = (sNextStripe[chip] + 1u) & 15u;
+            }
+#endif
             sFillOff = 0;
             sFillCrc = 0xFFFFFFFFu;
             sFillEpoch = sJob.source_epoch;
@@ -669,12 +907,14 @@ static CACHE_RAM_CODE void publishVerified(void)
             sFillDropReason = FILL_DROP_EXISTING;
             sFillDefer++;
         }
+#endif
     }
 
     sDidPublish = 1;
     sJobActive = 0;
     sJobSdStarted = 0;
     sJobUseFallback = 0;
+    return committed;
 }
 
 static CACHE_RAM_CODE void jobStart(const cs_job* job)
@@ -687,10 +927,23 @@ static CACHE_RAM_CODE void jobStart(const cs_job* job)
     sJobL2Epoch = job->source_epoch;
 
     uint32_t sector = job->id.sector;
+#ifndef CACHE_FULL_PAGE_4CHIP
     uint32_t idx = cacheIdx(sector);
+#endif
     // M1/M2/M3 keep the demand on SD so the mode matrix is a real control
     // variable. M4 VERIFIES entries against SD instead of serving them; only M5
     // serves a verified hit. A degraded backend never serves a hit (section 11).
+#ifdef CACHE_FULL_PAGE_4CHIP
+    if (sEnabled && !sDegraded && sL2Mode == CACHE_L2_MODE_M5 &&
+        cachePageStoreBeginRead(&sPageStore, &sDemandPageTask, sector,
+                                sJobL2Epoch, sDemandStage))
+    {
+        sJobSrc = 1;
+        sHits++;
+        sL2HitAttempt++;
+        return;
+    }
+#else
     if (sEnabled && !sDegraded && sL2Mode == CACHE_L2_MODE_M5 && sState[idx] == 2 &&
         sTagEpoch[idx] == sJobL2Epoch && sTag[idx] == sector)
     {
@@ -701,13 +954,33 @@ static CACHE_RAM_CODE void jobStart(const cs_job* job)
         sL2HitAttempt++;
         return;
     }
+#endif
 
     sJobSrc = 0;
     sMisses++;
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    if (sector == 0 && sBootSector0Valid)
+    {
+        // Consume once and go through the ordinary cs_commit/E4/E5 path.
+        // No SD transfer is started in the host's first poll window.
+        memcpy(sDemandStage, sBootSector0, CS_SECTOR_BYTES);
+        sBootSector0Valid = 0;
+        sJobSrc = 2;
+    }
+#endif
 }
 
 static CACHE_RAM_CODE void jobStep(void)
 {
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    if (sJobSrc == 2)
+    {
+        sJobSrc = 0; // SD-origin data may follow the normal snapshot policy.
+        sBootSeedUse++;
+        publishVerified();
+        return;
+    }
+#endif
     if (sJobSrc == 0)
     {
         if (!sJobSdStarted)
@@ -755,11 +1028,59 @@ static CACHE_RAM_CODE void jobStep(void)
     }
 
     // L2 hit read: chunked PSRAM -> staging, CRC checked against the directory.
+#ifdef CACHE_FULL_PAGE_4CHIP
+    if (sJobL2Epoch != sCacheEpoch ||
+        sJob.id.media_epoch != sCs.media_epoch ||
+        sJob.id.write_epoch != sCs.write_epoch)
+    {
+        cachePageStoreCancel(&sPageStore, &sDemandPageTask);
+        sJobSrc = 0;
+        sJobSdStarted = 0;
+        sJobUseFallback = 1;
+        return;
+    }
+    cachePageIo io = { sHw->psramRead, sHw->psramWrite };
+    uint32_t before = sDemandPageTask.read_bytes;
+    cachePageResult pageResult = cachePageStoreStep(&sPageStore,
+                                                    &sDemandPageTask, &io);
+    sReadBytes += sDemandPageTask.read_bytes - before;
+    if (pageResult == CACHE_PAGE_BUSY) return;
+    if (pageResult == CACHE_PAGE_DONE && sJobL2Epoch == sCacheEpoch &&
+        sJob.id.media_epoch == sCs.media_epoch &&
+        sJob.id.write_epoch == sCs.write_epoch)
+    {
+        sL2HitVerified++;
+        if (publishVerified())
+        {
+            sDemandHitOk++;
+            sPageHitOk[cachePageMapChip(sDemandPageTask.lease.slot)]++;
+        }
+        return;
+    }
+    if (pageResult == CACHE_PAGE_IO_FAIL)
+    {
+        sErrors++;
+        sPsramReadFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_PSRAM, sJob.id.sector);
+        cacheSdDegrade(CS_FAULT_PSRAM);
+    }
+    else if (pageResult == CACHE_PAGE_CORRUPT)
+    {
+        sErrors++;
+        sL2CrcFail++;
+        noteFaultLocked(CS_FAULT_L2_CRC, sJob.id.sector);
+    }
+    sJobSrc = 0;
+    sJobSdStarted = 0;
+    sJobUseFallback = 1;
+    return;
+#else
     uint32_t frag = CS_SECTOR_BYTES - sJobOff;
     if (frag > PSRAM_CACHE_FRAG_BYTES)
         frag = PSRAM_CACHE_FRAG_BYTES;
     uint32_t chip = sJobL2Idx & 3u;
-    uint32_t base = (sJobL2Idx >> 2) * CS_SECTOR_BYTES + sJobOff;
+    uint32_t base = cacheAddr(sJobL2Idx, sJobOff);
     uint8_t* dst = &sDemandStage[sJobOff];
 
     if (!sHw->psramRead(chip, base, dst, frag))
@@ -795,8 +1116,8 @@ static CACHE_RAM_CODE void jobStep(void)
     if (ok)
     {
         sL2HitVerified++;
-        sDemandHitOk++;
-        publishVerified();
+        if (publishVerified())
+            sDemandHitOk++;
         return;
     }
 
@@ -809,6 +1130,7 @@ static CACHE_RAM_CODE void jobStep(void)
     sJobSrc = 0;
     sJobSdStarted = 0;
     sJobUseFallback = 1;
+#endif
 }
 
 // M4 READ_PROBE (design section 10): read the existing L2 entry in bounded
@@ -818,11 +1140,68 @@ static CACHE_RAM_CODE void jobStep(void)
 // reporting a legitimate update as a CRC error.
 static CACHE_RAM_CODE void probeStep(void)
 {
+#ifdef CACHE_FULL_PAGE_4CHIP
+    cachePageIo io = { sHw->psramRead, sHw->psramWrite };
+    uint32_t before = sFillPageTask.read_bytes;
+    cachePageResult result = cachePageStoreStep(&sPageStore, &sFillPageTask, &io);
+    sReadBytes += sFillPageTask.read_bytes - before;
+    sFillOff = sFillPageTask.offset;
+    if (result == CACHE_PAGE_BUSY) return;
+    bool epochOk = sFillEpoch == sCacheEpoch &&
+                   sFillMediaEpoch == sCs.media_epoch &&
+                   sFillWriteEpoch == sCs.write_epoch;
+    if (!epochOk || result == CACHE_PAGE_CANCELLED)
+    {
+        sFillDropReason = FILL_DROP_EPOCH;
+        sFillDrop++;
+    }
+    else if (result == CACHE_PAGE_DONE)
+    {
+        sL2HitVerified++;
+        sProbeOk++;
+        sPageProbe[cachePageMapChip(sFillPageTask.lease.slot)]++;
+    }
+    else if (result == CACHE_PAGE_IO_FAIL)
+    {
+        sErrors++;
+        sPsramReadFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_PSRAM, sFillSector);
+        cacheSdDegrade(CS_FAULT_PSRAM);
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_DEGRADE;
+    }
+    else
+    {
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+        if (!sProbeFirstValid && sFillPageTask.first_bad_offset < CS_SECTOR_BYTES)
+        {
+            sProbeFirstSector = sFillSector;
+            sProbeFirstOffset = sFillPageTask.first_bad_offset;
+            sProbeFirstExpected = sFillStage[sProbeFirstOffset];
+            sProbeFirstActual = sFillPageTask.scratch[sProbeFirstOffset & 31u];
+            sProbeFirstRefCrc = crc32Update(0xFFFFFFFFu, sFillStage,
+                                           CS_SECTOR_BYTES) ^ 0xFFFFFFFFu;
+            sProbeFirstTagCrc = sFillPageTask.expected_table_crc;
+            sProbeFirstValid = 1;
+        }
+#endif
+        sErrors++;
+        sL2CrcFail++;
+        noteFaultLocked(CS_FAULT_L2_CRC, sFillSector);
+        cacheSdDegrade(CS_FAULT_L2_CRC);
+        sFillDrop++;
+        sFillDropReason = FILL_DROP_SUPERSEDED;
+    }
+    sFillIsProbe = 0;
+    sFillState = FILL_RETIRED;
+    return;
+#else
     uint32_t frag = CS_SECTOR_BYTES - sFillOff;
     if (frag > PSRAM_CACHE_FRAG_BYTES)
         frag = PSRAM_CACHE_FRAG_BYTES;
     uint32_t chip = sFillIdx & 3u;
-    uint32_t base = (sFillIdx >> 2) * CS_SECTOR_BYTES + sFillOff;
+    uint32_t base = fillAddr(sFillOff);
 
     if (!sHw->psramRead(chip, base, sProbeChunk, frag))
     {
@@ -840,7 +1219,20 @@ static CACHE_RAM_CODE void probeStep(void)
     }
 
     sReadBytes += frag;
-    bool match = memcmp(sProbeChunk, &sFillStage[sFillOff], frag) == 0;
+    uint32_t fragmentOffset = sFillOff;
+    bool match = memcmp(sProbeChunk, &sFillStage[fragmentOffset], frag) == 0;
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+    uint32_t mismatchOffset = 0, expected = 0, actual = 0, refCrc = 0;
+    if (!match && !sProbeFirstValid)
+    {
+        while (mismatchOffset < frag &&
+               sProbeChunk[mismatchOffset] == sFillStage[fragmentOffset + mismatchOffset])
+            mismatchOffset++;
+        expected = sFillStage[fragmentOffset + mismatchOffset];
+        actual = sProbeChunk[mismatchOffset];
+        refCrc = crc32Update(0xFFFFFFFFu, sFillStage, CS_SECTOR_BYTES) ^ 0xFFFFFFFFu;
+    }
+#endif
     sFillOff += frag;
     bool complete = (sFillOff >= CS_SECTOR_BYTES);
     if (!match)
@@ -852,20 +1244,48 @@ static CACHE_RAM_CODE void probeStep(void)
     bool epochOk = (sFillEpoch == sCacheEpoch) &&
                    (sFillMediaEpoch == sCs.media_epoch) &&
                    (sFillWriteEpoch == sCs.write_epoch);
-    if (match && epochOk)
+    if (!epochOk)
     {
-        sL2HitVerified++;
-        sProbeOk++;
+        // A write or media change can occur during psramRead. Discard the
+        // comparison even if the bytes now differ from the old SD snapshot.
+        sFillDropReason = FILL_DROP_EPOCH;
+        sFillDrop++;
     }
     else if (match)
     {
-        // Legitimate update during the probe: cancel, do not report CRC.
-        sFillDropReason = FILL_DROP_EPOCH;
-        sFillDrop++;
+        sL2HitVerified++;
+        sProbeOk++;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+        sShadowBanks[sFillIdx & 3u] |= 1u << sFillStripe;
+        sShadowVerify[sFillIdx & 3u]++;
+#endif
+#ifdef CACHE_M4_PROMOTE_M5_AFTER_PROBES
+        // Qualify the transport with independent SD comparisons before trying
+        // the demand hit path. A separate experimental switch controls whether
+        // promoted M5 may keep filling in the acknowledged quiet window.
+        if (sL2Mode == CACHE_L2_MODE_M4 && sProbeOk >= 32u &&
+            !sL2CrcFail && !sPsramReadFail && !sPsramFillFail && !sDegraded)
+        {
+            sM4Promoted = 1;
+            sL2Mode = CACHE_L2_MODE_M5;
+        }
+#endif
     }
     else
     {
         // Real content mismatch: refuse the entry and fall back to SD.
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+        if (!sProbeFirstValid)
+        {
+            sProbeFirstSector = sFillSector;
+            sProbeFirstOffset = fragmentOffset + mismatchOffset;
+            sProbeFirstExpected = expected;
+            sProbeFirstActual = actual;
+            sProbeFirstRefCrc = refCrc;
+            sProbeFirstTagCrc = sCrc[sFillIdx];
+            sProbeFirstValid = 1;
+        }
+#endif
         if (sState[sFillIdx] != 1)
             sState[sFillIdx] = 0;
         sL2CrcFail++;
@@ -877,6 +1297,11 @@ static CACHE_RAM_CODE void probeStep(void)
     sHw->irqRestore(save);
     sFillIsProbe = 0;
     sFillState = FILL_RETIRED;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    if (epochOk && !match)
+        cacheSdDegrade(CS_FAULT_L2_CRC);
+#endif
+#endif
 }
 
 static CACHE_RAM_CODE void fillStep(void)
@@ -886,11 +1311,79 @@ static CACHE_RAM_CODE void fillStep(void)
         probeStep();
         return;
     }
+#ifdef CACHE_FULL_PAGE_4CHIP
+    cachePageIo io = { sHw->psramRead, sHw->psramWrite };
+    uint32_t beforeRead = sFillPageTask.read_bytes;
+    uint32_t beforeWrite = sFillPageTask.write_bytes;
+    cachePageResult result = cachePageStoreStep(&sPageStore, &sFillPageTask, &io);
+    sReadBytes += sFillPageTask.read_bytes - beforeRead;
+    sWriteBytes += sFillPageTask.write_bytes - beforeWrite;
+    sFillOff = sFillPageTask.offset;
+    if (result == CACHE_PAGE_BUSY) return;
+    if (result == CACHE_PAGE_DONE)
+    {
+        bool epochOk = sFillEpoch == sCacheEpoch &&
+                       sFillMediaEpoch == sCs.media_epoch &&
+                       sFillWriteEpoch == sCs.write_epoch;
+        if (!epochOk)
+        {
+            cachePageMapInvalidate(&sPageStore.map, &sFillPageTask.lease);
+            sFillDrop++;
+            sFillDropReason = FILL_DROP_EPOCH;
+            sFillState = FILL_DROP;
+            return;
+        }
+        sFills++;
+        sFillCommit++;
+        uint32_t chip = cachePageMapChip(sFillPageTask.lease.slot);
+        uint32_t set = sFillPageTask.lease.slot / CACHE_PAGE_CHIPS;
+        sPageFill[chip]++;
+        if (set > sPageMaxSet[chip]) sPageMaxSet[chip] = set;
+        sFillState = FILL_COMMITTED;
+        if (sL2Mode == CACHE_L2_MODE_M4 &&
+            cachePageStoreBeginProbe(&sPageStore, &sFillPageTask,
+                                      sFillSector, sFillEpoch, sFillStage))
+        {
+            sFillOff = 0;
+            sFillIsProbe = 1;
+            sFillState = FILL_ADMITTED;
+            sL2HitAttempt++;
+            sProbeTry++;
+            return;
+        }
+        sFillState = FILL_RETIRED;
+        return;
+    }
+    if (result == CACHE_PAGE_IO_FAIL)
+    {
+        sErrors++;
+        sPsramFillFail++;
+        sFillQuarantine++;
+        noteFaultLocked(CS_FAULT_FILL, sFillSector);
+        cacheSdDegrade(CS_FAULT_FILL);
+        sFillDropReason = FILL_DROP_DEGRADE;
+    }
+    else if (result == CACHE_PAGE_CORRUPT)
+    {
+        sErrors++;
+        sL2CrcFail++;
+        noteFaultLocked(CS_FAULT_L2_CRC, sFillSector);
+        cacheSdDegrade(CS_FAULT_L2_CRC);
+        sFillDropReason = FILL_DROP_DEGRADE;
+    }
+    else
+    {
+        sFillDropReason = FILL_DROP_EPOCH;
+    }
+    sFillDrop++;
+    sFillState = FILL_QUARANTINED;
+    return;
+#else
     uint32_t frag = CS_SECTOR_BYTES - sFillOff;
     if (frag > PSRAM_CACHE_FRAG_BYTES)
         frag = PSRAM_CACHE_FRAG_BYTES;
     uint32_t chip = sFillIdx & 3u;
-    uint32_t base = (sFillIdx >> 2) * CS_SECTOR_BYTES + sFillOff;
+    uint32_t base = fillAddr(sFillOff);
 
     if (!sHw->psramWrite(chip, base, &sFillStage[sFillOff], frag))
     {
@@ -930,6 +1423,9 @@ static CACHE_RAM_CODE void fillStep(void)
         sTag[sFillIdx] = sFillSector;
         sTagEpoch[sFillIdx] = sFillEpoch;
         sCrc[sFillIdx] = sFillCrc;
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+        sStripe[sFillIdx] = sFillStripe;
+#endif
         sState[sFillIdx] = 2;
         sFills++;
         sFillCommit++;
@@ -944,9 +1440,24 @@ static CACHE_RAM_CODE void fillStep(void)
         sFillState = FILL_DROP;
     }
     sHw->irqRestore(save);
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    if (sFillState == FILL_COMMITTED)
+    {
+        // Reuse the immutable SD snapshot for an immediate full-sector read
+        // probe. A newly written high stripe is never counted as verified
+        // until all 512 B have returned and matched the independent SD copy.
+        sFillOff = 0;
+        sFillIsProbe = 1;
+        sFillState = FILL_ADMITTED;
+        sL2HitAttempt++;
+        sProbeTry++;
+        return;
+    }
+#endif
     // Cleanup finished; the dedicated snapshot buffer is reusable.
     sFillIsProbe = 0;
     sFillState = FILL_RETIRED;
+#endif
 }
 
 // A snapshot whose source response was retired without a completed send can
@@ -1028,9 +1539,42 @@ CACHE_RAM_CODE cacheSdStepResult cacheSdStep(void)
                       ((uint32_t)(sHw->nowUs() - t0) >= sTStepMaxUs);
     // Prepared/acked responses remain foreground work after job completion.
     // Recheck at every fragment, including fragments of an older fill.
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    bool dmaBusy = sHw->dma0Busy();
+    bool cartIdle = sHw->cartIdle();
+    bool foreground = sCs.intent_valid || sCs.completion_valid ||
+                      sCs.binding_valid || sCs.write_pending ||
+                      dmaBusy || !cartIdle;
+    // Experimental M3/M4 path: the automatically queued next sector has an
+    // acknowledged, immutable binding, but no E5 is in progress. The response
+    // slot and binding are untouched. Each main-loop pass may launch at most
+    // one 32-byte fragment after a full quiet interval; a new host command
+    // resets the interval. Real IRQ/PSRAM coexistence still needs board proof.
+    uint32_t quietNow = (uint32_t)sHw->nowUs();
+    uint32_t hostSeq = sHostCommandSeq;
+    bool quietMode = (sL2Mode == CACHE_L2_MODE_M3 ||
+                      sL2Mode == CACHE_L2_MODE_M4);
+#ifdef CACHE_M5_QUIET_FILL_AFTER_PROMOTION
+    quietMode = quietMode || (sL2Mode == CACHE_L2_MODE_M5 && sM4Promoted);
+#endif
+#if defined(CACHE_FULL_PAGE_4CHIP) && defined(CACHE_PAGE_M5_EXPERIMENT)
+    quietMode = quietMode || (sL2Mode == CACHE_L2_MODE_M5);
+#endif
+    bool quietBinding = quietMode && sCs.intent_valid &&
+                        sCs.intent_consumed && sCs.binding_valid &&
+                        !sCs.completion_valid && !sCs.write_pending &&
+                        cs_identity_equal(&sCs.binding.id, &sCs.intent) &&
+                        sCs.binding.offer_id == sCs.acked_offer_id &&
+                        sCs.resp_state == CS_RESP_ACKED && !dmaBusy && cartIdle &&
+                        (uint32_t)(quietNow - sLastHostCommandUs) >= CACHE_FILL_QUIET_US &&
+                        (uint32_t)(quietNow - sLastQuietFragmentUs) >= CACHE_FILL_QUIET_US;
+    bool allowFill = !foreground || quietBinding;
+#else
     bool foreground = sCs.intent_valid || sCs.completion_valid ||
                       sCs.binding_valid || sCs.write_pending ||
                       sHw->dma0Busy() || !sHw->cartIdle();
+    bool allowFill = !foreground;
+#endif
 #if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
     // Observe the existing gate, without extra hardware calls or changing its
     // decision. Sample one in 1024 eligible steps, not millions of SRAM
@@ -1051,23 +1595,47 @@ CACHE_RAM_CODE cacheSdStepResult cacheSdStep(void)
         if (overBudget) mask |= CACHE_GATE_BUDGET;
         sGateMask = mask;
         sGateChecks++;
-        if ((!FILL_LEGACY_PUBLISH && (sDidPublish || foreground)) ||
+        if ((!FILL_LEGACY_PUBLISH && (sDidPublish || !allowFill)) ||
             sJobActive || overBudget)
             sGateBlocked++;
     }
 #endif
     if ((!sDidPublish || FILL_LEGACY_PUBLISH) && !sJobActive &&
-        (!foreground || FILL_LEGACY_PUBLISH) && !overBudget &&
+        (allowFill || FILL_LEGACY_PUBLISH) && !overBudget &&
         (sFillState == FILL_ADMITTED || sFillState == FILL_TRANSFERRING))
     {
         if (sFillState == FILL_ADMITTED && sTIdleAdmitUs != 0 && !sHw->cartIdle())
         {
             sFillDefer++;
         }
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+        else if (hostSeq != sHostCommandSeq || sHw->dma0Busy() ||
+                 !sHw->cartIdle() || sCs.write_pending ||
+                 sFillEpoch != sCacheEpoch)
+        {
+            // An IRQ changed the state after the first gate sample. It can
+            // still arrive during a fragment; that overlap is counted below.
+            sFillDefer++;
+        }
+#endif
         else
         {
             sFillState = FILL_TRANSFERRING;
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+            uint32_t fragmentStart = (uint32_t)sHw->nowUs();
+            sQuietFragmentActive = quietBinding ? 1u : 0u;
+#endif
             fillStep();
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+            sQuietFragmentActive = 0;
+            if (quietBinding)
+            {
+                uint32_t elapsed = (uint32_t)sHw->nowUs() - fragmentStart;
+                sLastQuietFragmentUs = (uint32_t)sHw->nowUs();
+                sQuietFillFragments++;
+                if (elapsed > sQuietFillMaxUs) sQuietFillMaxUs = elapsed;
+            }
+#endif
             did = true;
         }
     }
@@ -1124,16 +1692,69 @@ CACHE_RAM_CODE void cacheSdGetCounters(cacheSdCounters* out)
     out->degraded = sDegraded;
     out->epoch = sCacheEpoch;
     out->sd_miss = sMisses;
+#ifdef CACHE_BOOT_SECTOR0_SEED
+    out->boot_seed_use = sBootSeedUse;
+#else
+    out->boot_seed_use = 0;
+#endif
     out->demand_hit_try = sHits;
     out->demand_hit_ok = sDemandHitOk;
+    out->demand_non_psram_ok = sDemandNonPsramOk;
     out->probe_try = sProbeTry;
     out->probe_ok = sProbeOk;
     out->read_bytes = sReadBytes;
     out->write_bytes = sWriteBytes;
+#ifdef CACHE_PROBE_MISMATCH_DIAG
+    out->probe_first_valid = sProbeFirstValid;
+    out->probe_first_sector = sProbeFirstSector;
+    out->probe_first_offset = sProbeFirstOffset;
+    out->probe_first_expected = sProbeFirstExpected;
+    out->probe_first_actual = sProbeFirstActual;
+    out->probe_first_ref_crc = sProbeFirstRefCrc;
+    out->probe_first_tag_crc = sProbeFirstTagCrc;
+#else
+    out->probe_first_valid = out->probe_first_sector = out->probe_first_offset = 0;
+    out->probe_first_expected = out->probe_first_actual = 0;
+    out->probe_first_ref_crc = out->probe_first_tag_crc = 0;
+#endif
+#ifdef CACHE_SHADOW_STRIPES_4CHIP
+    for (uint32_t chip = 0; chip < 4u; chip++)
+    {
+        out->shadow_banks[chip] = sShadowBanks[chip];
+        out->shadow_verify[chip] = sShadowVerify[chip];
+    }
+#else
+    for (uint32_t chip = 0; chip < 4u; chip++)
+        out->shadow_banks[chip] = out->shadow_verify[chip] = 0;
+#endif
+#ifdef CACHE_FULL_PAGE_4CHIP
+    for (uint32_t chip = 0; chip < 4u; chip++)
+    {
+        out->page_fill[chip] = sPageFill[chip];
+        out->page_probe[chip] = sPageProbe[chip];
+        out->page_hit_ok[chip] = sPageHitOk[chip];
+        out->page_max_set[chip] = sPageMaxSet[chip];
+    }
+    out->page_valid_sectors = cachePageStoreValidSectors(&sPageStore, sCacheEpoch);
+#else
+    for (uint32_t chip = 0; chip < 4u; chip++)
+        out->page_fill[chip] = out->page_probe[chip] =
+            out->page_hit_ok[chip] = out->page_max_set[chip] = 0;
+    out->page_valid_sectors = 0;
+#endif
     out->fill_state = sFillState;
     out->fill_sector = sFillSector;
     out->fill_offset = sFillOff;
     out->snapshot = sFillSnapshotId;
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    out->quiet_fill_fragments = sQuietFillFragments;
+    out->quiet_fill_max_us = sQuietFillMaxUs;
+    out->quiet_irq_overlap = sQuietIrqOverlap;
+    out->quiet_e5_overlap = sQuietE5Overlap;
+#else
+    out->quiet_fill_fragments = out->quiet_fill_max_us = 0;
+    out->quiet_irq_overlap = out->quiet_e5_overlap = 0;
+#endif
 #if defined(CACHE_WATCH_ACTIVE_MARKERS) || defined(CACHE_SD_HOST)
     out->gate_measured = 1;
     out->gate_checks = sGateChecks;
@@ -1155,12 +1776,16 @@ CACHE_RAM_CODE void cacheSdGetCounters(cacheSdCounters* out)
 
 CACHE_RAM_CODE uint32_t cacheSdSectors(void)
 {
+#ifdef CACHE_FULL_PAGE_4CHIP
+    return cachePageStoreValidSectors(&sPageStore, sCacheEpoch);
+#else
     uint32_t n = 0;
     uint32_t ep = sCacheEpoch;
     for (uint32_t i = 0; i < CACHE_SD_SECTORS; i++)
         if (sState[i] == 2 && sTagEpoch[i] == ep)
             n++;
     return n;
+#endif
 }
 
 CACHE_RAM_CODE const cs_state* cacheSdState(void)

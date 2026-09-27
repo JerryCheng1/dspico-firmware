@@ -83,6 +83,22 @@ bool psramInitDevice(void);
 // Write/read-back an isolated block (never a live cache entry). Bounded by the
 // transport spin limit; sets SELFTEST_OK only on a full compare.
 bool psramSelfTest(void);
+#ifdef CACHE_PSRAM_BOOT_DIAG
+typedef struct
+{
+    u32 flags; // bit0 write, bit1 PIO read, bit2 SIO read, bit3 PIO match, bit4 SIO match
+    u32 pioOff, sioOff;
+    u8 expectedPio, actualPio, expectedSio, actualSio;
+} psramCacheWindowDiag;
+// Before cartridge service, exercise chip 0/address 0 in the same 32-byte
+// fragments used by the cache, then compare PIO and independent SIO reads.
+psramCacheWindowDiag psramCacheWindowSelfTest(void);
+#ifdef CACHE_PSRAM_SECTOR0_DIAG
+// Same 32-byte PIO writes and PIO/SIO readback using the prewarmed SD data.
+psramCacheWindowDiag psramCacheWindowDataTest(const u8 source[512]);
+psramCacheWindowDiag psramCacheWindowSioWriteTest(const u8 source[512]);
+#endif
+#endif
 // Allow the cache data path. Ignored unless SELFTEST_OK (the caller decides for
 // init-only modes, which never transport data).
 void psramSetRuntimeEnabled(bool enabled);
@@ -123,6 +139,18 @@ bool psramWrite(u32 chip, u32 addr, const void* buf, u32 len);
 // the PIO engine against the proven bit-bang backend.
 bool psramBitBangRead(u32 chip, u32 addr, void* buf, u32 len);
 bool psramBitBangWrite(u32 chip, u32 addr, const void* buf, u32 len);
+
+// Standalone qualification only: inject one transport fault, then inspect the
+// controller's idle state. These hooks are never built into DSpico.
+#ifdef PSRAM_QUAL_FAULT_TEST
+enum {
+    PSRAM_QUAL_FAULT_RX_STALL = 1,
+    PSRAM_QUAL_FAULT_TX_STALL = 2,
+    PSRAM_QUAL_FAULT_TX_AFTER_DMA = 3,
+};
+void psramQualInjectFaultOnce(u8 fault);
+bool psramQualBusIdle(void);
+#endif
 
 // Decode the density from a raw APS6404L ID; returns bytes or 0 if unknown.
 // \p id is the 16-byte raw capture; the 0x0D/0x5D signature is searched for.

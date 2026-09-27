@@ -6,8 +6,65 @@
 #if CACHE_STAGE >= 3
 #include "cacheSd.h"
 #endif
+#ifdef CACHE_PSRAM_SECTOR0_DIAG
+#include "psram.h"
+#include <string.h>
+#endif
 #ifdef ENABLE_UART_LOG
 #include "uartLog.h"
+#endif
+
+#ifdef CACHE_PSRAM_SECTOR0_DIAG
+static void psramBootReadStartProbe(u32 chip, u32 addr, u8 expected)
+{
+    u8 sio = 0, pio = 0;
+    bool sioRead = psramBitBangRead(chip, addr, &sio, 1);
+    bool pioRead = psramRead(chip, addr, &pio, 1);
+    uartLogPrintfBlocking("[psram-start] chip=%lu addr=%lu exp=%02X status=%u/%u sio=%02X pio=%02X\n",
+        (unsigned long)chip, (unsigned long)addr, (unsigned)expected,
+        (unsigned)sioRead, (unsigned)pioRead,
+        (unsigned)sio, (unsigned)pio);
+}
+
+static void psramBootAddressProbe(u32 chip)
+{
+    static u8 source[32] __attribute__((aligned(4)));
+    static u8 sioBlock[32] __attribute__((aligned(4)));
+    static u8 pioBlock[32] __attribute__((aligned(4)));
+    const u32 base = 416;
+    for (u32 i = 0; i < sizeof(source); i++)
+        source[i] = (u8)(0xA5u ^ (u8)(i * 37u));
+    source[440 - base] = 0x52;
+
+    bool wrote = psramBitBangWrite(chip, base, source, sizeof(source));
+    bool sioRead = wrote && psramBitBangRead(chip, base, sioBlock, sizeof(sioBlock));
+    bool pioRead = wrote && psramRead(chip, base, pioBlock, sizeof(pioBlock));
+    uartLogPrintfBlocking("[psram-block] chip=%lu base=%lu status=%u/%u/%u exp440=%02X sio440=%02X pio440=%02X equal=%u/%u\n",
+        (unsigned long)chip, (unsigned long)base,
+        (unsigned)wrote, (unsigned)sioRead, (unsigned)pioRead,
+        (unsigned)source[440 - base], (unsigned)sioBlock[440 - base],
+        (unsigned)pioBlock[440 - base],
+        (unsigned)(sioRead && memcmp(source, sioBlock, sizeof(source)) == 0),
+        (unsigned)(pioRead && memcmp(source, pioBlock, sizeof(source)) == 0));
+
+    if (!wrote || !sioRead || !pioRead)
+        return;
+    psramBootReadStartProbe(chip, 416, source[0]);
+    psramBootReadStartProbe(chip, 417, source[1]);
+    psramBootReadStartProbe(chip, 432, source[16]);
+    psramBootReadStartProbe(chip, 440, source[24]);
+    psramBootReadStartProbe(chip, 441, source[25]);
+
+    u8 replacement = 0x0A;
+    bool writeOne = psramBitBangWrite(chip, 440, &replacement, 1);
+    sioRead = writeOne && psramBitBangRead(chip, base, sioBlock, sizeof(sioBlock));
+    pioRead = writeOne && psramRead(chip, base, pioBlock, sizeof(pioBlock));
+    uartLogPrintfBlocking("[psram-write1] chip=%lu addr=440 wr=0A status=%u/%u/%u sio440=%02X pio440=%02X sio441=%02X pio441=%02X\n",
+        (unsigned long)chip,
+        (unsigned)writeOne, (unsigned)sioRead, (unsigned)pioRead,
+        (unsigned)sioBlock[440 - base], (unsigned)pioBlock[440 - base],
+        (unsigned)sioBlock[441 - base], (unsigned)pioBlock[441 - base]);
+}
 #endif
 
 // E4 poll pre-arm: while a status poll storm runs, the length word for the
@@ -120,6 +177,9 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd0)(ntr_rom_emu_t* romEm
     cartTxBegin();
     ntrc_noPayload(pio);
     ntrc_finishGameNoScrambleCmd0(romEmu);
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    cacheSdNoteHostCommandFromIrq(CACHE_HOST_CMD_E3);
+#endif
 }
 
 extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
@@ -241,6 +301,9 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEm
         (void)cacheSdPollReadySampled(sdReady != 0);
 #endif
     ntrc_finishGameNoScrambleCmd0(romEmu);
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    cacheSdNoteHostCommandFromIrq(CACHE_HOST_CMD_E4);
+#endif
 
     if (sWriteBusy && sdReady && sNextWriteBlockQueued)
     {
@@ -307,6 +370,9 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdDataCmd0)(ntr_rom_emu_t* romEm
 
     cartTxBegin();
     ntrc_finishGameNoScrambleCmd0(romEmu);
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    cacheSdNoteHostCommandFromIrq(CACHE_HOST_CMD_E5);
+#endif
 }
 
 extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdDataCmd1)(ntr_rom_emu_t* romEmu, u32 word, pio_hw_t* pio)
@@ -349,6 +415,9 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameWriteSdDataCmd0)(ntr_rom_emu_t* rom
 #endif
 
     ntrc_finishGameNoScrambleCmd0(romEmu);
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+    cacheSdNoteHostCommandFromIrq(CACHE_HOST_CMD_F6);
+#endif
 }
 
 static void __scratch_y("cpu0")(sdWritePayloadComplete)(ntr_rom_emu_t* romEmu)
@@ -441,7 +510,8 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameWriteSdDataCmd1)(ntr_rom_emu_t* rom
 // ready immediately.
 extern "C" void ntrc_gameSdPrewarm(void)
 {
-    if (!gSdCard.TryReadSectorsSync(&sSdSectorBuf[0], 0, 1))
+    if (!gSdCard.TryReadSectorsSync(&sSdSectorBuf[0], 0, 1) ||
+        gSdCard.GetSectorsCompleted() != 1)
     {
 #ifdef ENABLE_UART_LOG
         uartLogPrintfBlocking("[sd] prewarm sec0 FAIL\n");
@@ -451,7 +521,47 @@ extern "C" void ntrc_gameSdPrewarm(void)
     sSdSectorBuffersSectors[0] = 0;
     sBufferIndex = 0;
     sReadBusy = false;
-#ifdef ENABLE_UART_LOG
+#if CACHE_STAGE >= 3 && defined(CACHE_BOOT_SECTOR0_SEED)
+    cacheSdSeedBootSector0(&sSdSectorBuf[0]);
+#endif
+#ifdef CACHE_PSRAM_SECTOR0_DIAG
+    static u8 sec0Snapshot[512] __attribute__((aligned(4)));
+    static u8 sparse52[512] __attribute__((aligned(4)));
+    for (u32 i = 0; i < 512u; i++)
+        sec0Snapshot[i] = sSdSectorBuf[i];
+    sparse52[440] = 0x52;
+    uartLogPrintfBlocking("[psram-src] snap440=%02X sd440=%02X\n",
+        (unsigned)sec0Snapshot[440], (unsigned)sSdSectorBuf[440]);
+    psramCacheWindowDiag lowDiag = psramCacheWindowDataTest(sec0Snapshot);
+    uartLogPrintfBlocking("[psram-sec0-pio-wr] flags=%02lX pioOff=%lu pio=%02X/%02X sioOff=%lu sio=%02X/%02X\n",
+        (unsigned long)lowDiag.flags, (unsigned long)lowDiag.pioOff,
+        (unsigned)lowDiag.expectedPio, (unsigned)lowDiag.actualPio,
+        (unsigned long)lowDiag.sioOff,
+        (unsigned)lowDiag.expectedSio, (unsigned)lowDiag.actualSio);
+    lowDiag = psramCacheWindowSioWriteTest(sec0Snapshot);
+    uartLogPrintfBlocking("[psram-sec0-sio-wr] flags=%02lX pioOff=%lu pio=%02X/%02X sioOff=%lu sio=%02X/%02X\n",
+        (unsigned long)lowDiag.flags, (unsigned long)lowDiag.pioOff,
+        (unsigned)lowDiag.expectedPio, (unsigned)lowDiag.actualPio,
+        (unsigned long)lowDiag.sioOff,
+        (unsigned)lowDiag.expectedSio, (unsigned)lowDiag.actualSio);
+    uartLogPrintfBlocking("[psram-src-after] snap440=%02X sd440=%02X\n",
+        (unsigned)sec0Snapshot[440], (unsigned)sSdSectorBuf[440]);
+    lowDiag = psramCacheWindowDataTest(sparse52);
+    uartLogPrintfBlocking("[psram-zero52-pio-wr] flags=%02lX pioOff=%lu pio=%02X/%02X sioOff=%lu sio=%02X/%02X\n",
+        (unsigned long)lowDiag.flags, (unsigned long)lowDiag.pioOff,
+        (unsigned)lowDiag.expectedPio, (unsigned)lowDiag.actualPio,
+        (unsigned long)lowDiag.sioOff,
+        (unsigned)lowDiag.expectedSio, (unsigned)lowDiag.actualSio);
+    lowDiag = psramCacheWindowSioWriteTest(sparse52);
+    uartLogPrintfBlocking("[psram-zero52-sio-wr] flags=%02lX pioOff=%lu pio=%02X/%02X sioOff=%lu sio=%02X/%02X\n",
+        (unsigned long)lowDiag.flags, (unsigned long)lowDiag.pioOff,
+        (unsigned)lowDiag.expectedPio, (unsigned)lowDiag.actualPio,
+        (unsigned long)lowDiag.sioOff,
+        (unsigned)lowDiag.expectedSio, (unsigned)lowDiag.actualSio);
+    for (u32 chip = 0; chip < PSRAM_CHIP_COUNT; chip++)
+        psramBootAddressProbe(chip);
+#endif
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
     const u32* p = (const u32*)&sSdSectorBuf[0];
     uartLogPrintfBlocking("[sd] prewarm sec0 OK head=%08lX %08lX sig=%04lX\n",
         (unsigned long)p[0], (unsigned long)p[1],

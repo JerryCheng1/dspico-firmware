@@ -46,10 +46,13 @@ add_compile_definitions(DSpico
 # boot-time output and leaves the real-time cartridge path untouched.
 option(ENABLE_UART_LOG "Boot-time UART logging (no runtime tracing)" OFF)
 option(ENABLE_CART_TRACE "Cartridge runtime diagnostics (requires ENABLE_UART_LOG)" OFF)
+option(ENABLE_SD_WRITE_PROTECT "Discard SD writes while reporting success to the host" OFF)
 # Stage S2: build the standalone APS6404L qualification firmware. It is a
 # separate executable and never links the cartridge runtime.
 option(PSRAM_QUAL_FIRMWARE "Build the standalone APS6404L (PSRAM) qualification firmware" OFF)
 option(PSRAM_QUAL_FULL "Qualification firmware: walk the full 8 MiB of every chip" OFF)
+option(PSRAM_QUAL_FAULT_TEST "Qualification firmware: inject bounded PIO/DMA faults and verify recovery" OFF)
+set(PSRAM_QUAL_WARM_CYCLES 0 CACHE STRING "Qualification firmware: successful automatic watchdog warm-reset cycles (requires fault test)")
 
 # Design section 11.1 stage switches. CACHE_STAGE gates which cache modules are
 # linked at all; CACHE_INIT_LOG/CACHE_STATS_LOG add bounded diagnostics and are
@@ -71,7 +74,22 @@ set(L2_DIAG_MODE "M5" CACHE STRING "L2 diagnostic mode M0..M5 (design section 10
 # default after acceptance.
 option(L2_LEGACY_PUBLISH_FILL "Contrast build: old publish-then-fill behaviour (M3 only)" OFF)
 option(CACHE_WATCH_LOG "Core1 WFE/SysTick cache diagnostics with idle gating" OFF)
+option(CACHE_SUMMARY_LOG "Quiet one-line cache capacity, occupancy and hit-rate log" OFF)
 option(CACHE_WATCH_ACTIVE_MARKERS "Intrusive core0 phase/gate/recovery markers (diagnostic experiments only)" OFF)
+option(CACHE_FILL_QUIET_EXPERIMENT "Experimental M3/M4 fill or probe during a quiet acknowledged next-sector request" OFF)
+option(CACHE_M4_PROMOTE_M5_AFTER_PROBES "Experimental M4-to-M5 transition after 32 clean full-sector probes; promoted M5 defaults to read-only" OFF)
+option(CACHE_M5_QUIET_FILL_AFTER_PROMOTION "Experimental continued M5 quiet-window fill after M4 probe qualification" OFF)
+option(CACHE_SHADOW_STRIPES_4CHIP "Experimental SD-served M4 shadow: rotate fills through 16 address stripes per PSRAM and verify every fill" OFF)
+option(CACHE_FULL_PAGE_4CHIP "Experimental 4-chip 4 KiB page directory and checksum-table backend" OFF)
+option(CACHE_PAGE_M5_EXPERIMENT "Allow M5 demand supply from the full-page backend after M4 hardware validation" OFF)
+set(CACHE_PAGE_M5_SET_LIMIT 2031 CACHE STRING "M5 physical 4 KiB page sets per chip (1..2031; default uses full cache capacity)")
+if(CACHE_PAGE_M5_EXPERIMENT AND NOT CACHE_FULL_PAGE_4CHIP)
+  message(FATAL_ERROR "CACHE_PAGE_M5_EXPERIMENT requires CACHE_FULL_PAGE_4CHIP")
+endif()
+option(CACHE_BOOT_SECTOR0_SEED "Serve the first stage-3 sector-0 demand from the boot prewarm buffer" OFF)
+option(CACHE_PROBE_MISMATCH_DIAG "Capture the first M4 PSRAM-vs-SD mismatch for idle UART diagnostics" OFF)
+option(CACHE_PSRAM_BOOT_DIAG "Test PSRAM cache address zero via PIO and SIO before cartridge service" OFF)
+option(CACHE_PSRAM_SECTOR0_DIAG "Test real SD sector zero at PSRAM cache address zero during prewarm" OFF)
 set(CACHE_BUILD_GIT_REV "" CACHE STRING "Git revision embedded in the cache boot banner")
 
 if(CACHE_STAGE LESS 0 OR CACHE_STAGE GREATER 10)
@@ -95,6 +113,9 @@ if(CACHE_STATS_LOG AND NOT CACHE_INIT_LOG)
 endif()
 if(CACHE_WATCH_ACTIVE_MARKERS AND NOT CACHE_WATCH_LOG)
   message(FATAL_ERROR "CACHE_WATCH_ACTIVE_MARKERS requires CACHE_WATCH_LOG")
+endif()
+if(CACHE_SUMMARY_LOG AND (NOT CACHE_WATCH_LOG OR NOT CACHE_FULL_PAGE_4CHIP))
+  message(FATAL_ERROR "CACHE_SUMMARY_LOG requires CACHE_WATCH_LOG and CACHE_FULL_PAGE_4CHIP")
 endif()
 if(CACHE_WATCH_LOG)
   if(CACHE_STAGE LESS 3 OR NOT ENABLE_UART_LOG)
@@ -186,6 +207,9 @@ if(CACHE_STATS_LOG)
 endif()
 if(CACHE_WATCH_LOG)
   target_compile_definitions(DSpico PRIVATE CACHE_WATCH_LOG=1)
+  if(CACHE_SUMMARY_LOG)
+    target_compile_definitions(DSpico PRIVATE CACHE_SUMMARY_LOG=1)
+  endif()
   target_sources(DSpico PRIVATE src/cacheDiagLog.c)
   target_link_libraries(DSpico hardware_exception)
   if(CACHE_WATCH_ACTIVE_MARKERS)
@@ -219,6 +243,99 @@ if(CACHE_STAGE GREATER_EQUAL 3)
     endif()
     target_compile_definitions(DSpico PRIVATE CACHE_L2_MODE=${_l2diag_num})
   endif()
+endif()
+if(CACHE_FILL_QUIET_EXPERIMENT)
+  string(TOUPPER "${L2_DIAG_MODE}" _fill_diag_mode)
+  if(CACHE_STAGE LESS 3 OR CACHE_L2_DISABLED OR
+     (NOT _fill_diag_mode STREQUAL "M3" AND NOT _fill_diag_mode STREQUAL "M4" AND
+      NOT (CACHE_FULL_PAGE_4CHIP AND CACHE_PAGE_M5_EXPERIMENT AND
+           _fill_diag_mode STREQUAL "M5")) OR
+     L2_LEGACY_PUBLISH_FILL OR NOT ENABLE_SD_WRITE_PROTECT)
+    message(FATAL_ERROR "CACHE_FILL_QUIET_EXPERIMENT requires stage 3, M3/M4 (or explicit full-page M5), write protection and no legacy fill")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_FILL_QUIET_EXPERIMENT=1)
+endif()
+if(CACHE_M4_PROMOTE_M5_AFTER_PROBES)
+  string(TOUPPER "${L2_DIAG_MODE}" _promote_diag_mode)
+  if(CACHE_STAGE LESS 3 OR CACHE_L2_DISABLED OR
+     NOT _promote_diag_mode STREQUAL "M4" OR
+     NOT CACHE_FILL_QUIET_EXPERIMENT OR
+     L2_LEGACY_PUBLISH_FILL OR NOT ENABLE_SD_WRITE_PROTECT)
+    message(FATAL_ERROR "CACHE_M4_PROMOTE_M5_AFTER_PROBES requires stage 3, M4, quiet experiment, write protection and no legacy fill")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_M4_PROMOTE_M5_AFTER_PROBES=1)
+endif()
+if(CACHE_M5_QUIET_FILL_AFTER_PROMOTION)
+  if(NOT CACHE_M4_PROMOTE_M5_AFTER_PROBES)
+    message(FATAL_ERROR "CACHE_M5_QUIET_FILL_AFTER_PROMOTION requires CACHE_M4_PROMOTE_M5_AFTER_PROBES")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_M5_QUIET_FILL_AFTER_PROMOTION=1)
+endif()
+if(CACHE_SHADOW_STRIPES_4CHIP)
+  string(TOUPPER "${L2_DIAG_MODE}" _shadow_diag_mode)
+  if(NOT CACHE_STAGE EQUAL 3 OR CACHE_L2_DISABLED OR
+     NOT _shadow_diag_mode STREQUAL "M4" OR
+     NOT CACHE_FILL_QUIET_EXPERIMENT OR
+     CACHE_M4_PROMOTE_M5_AFTER_PROBES OR
+     CACHE_M5_QUIET_FILL_AFTER_PROMOTION OR
+     NOT ENABLE_SD_WRITE_PROTECT OR NOT CACHE_WATCH_LOG OR
+     NOT CACHE_PROBE_MISMATCH_DIAG)
+    message(FATAL_ERROR "CACHE_SHADOW_STRIPES_4CHIP requires stage 3 M4 quiet-fill, SD write protection, watch/probe diagnostics and no M5 promotion")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_SHADOW_STRIPES_4CHIP=1)
+endif()
+if(CACHE_FULL_PAGE_4CHIP)
+  string(TOUPPER "${L2_DIAG_MODE}" _page_diag_mode)
+  if(NOT CACHE_STAGE EQUAL 3 OR CACHE_L2_DISABLED OR
+     CACHE_SHADOW_STRIPES_4CHIP OR NOT CACHE_FILL_QUIET_EXPERIMENT OR
+     NOT ENABLE_SD_WRITE_PROTECT OR NOT CACHE_WATCH_LOG OR
+     (CACHE_M4_PROMOTE_M5_AFTER_PROBES AND NOT CACHE_PAGE_M5_EXPERIMENT) OR
+     (NOT _page_diag_mode STREQUAL "M4" AND
+      NOT _page_diag_mode STREQUAL "M5") OR
+     (_page_diag_mode STREQUAL "M5" AND NOT CACHE_PAGE_M5_EXPERIMENT))
+    message(FATAL_ERROR "CACHE_FULL_PAGE_4CHIP requires stage 3, M4 (or explicitly allowed M5), quiet-fill, SD write protection, watch logging and no stripe shadow")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_FULL_PAGE_4CHIP=1)
+  if(CACHE_PAGE_M5_EXPERIMENT)
+    if(NOT CACHE_PAGE_M5_SET_LIMIT MATCHES "^[0-9]+$" OR
+       CACHE_PAGE_M5_SET_LIMIT LESS 1 OR CACHE_PAGE_M5_SET_LIMIT GREATER 2031)
+      message(FATAL_ERROR "CACHE_PAGE_M5_SET_LIMIT must be 1..2031")
+    endif()
+    target_compile_definitions(DSpico PRIVATE CACHE_PAGE_M5_EXPERIMENT=1)
+    target_compile_definitions(DSpico PRIVATE CACHE_PAGE_ACTIVE_SETS=${CACHE_PAGE_M5_SET_LIMIT})
+  endif()
+  target_sources(DSpico PRIVATE src/cachePageMap.c src/cachePageStore.c)
+endif()
+if(CACHE_BOOT_SECTOR0_SEED)
+  if(CACHE_STAGE LESS 3)
+    message(FATAL_ERROR "CACHE_BOOT_SECTOR0_SEED requires CACHE_STAGE>=3")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_BOOT_SECTOR0_SEED=1)
+endif()
+if(CACHE_PROBE_MISMATCH_DIAG)
+  string(TOUPPER "${L2_DIAG_MODE}" _probe_diag_mode)
+  if(CACHE_STAGE LESS 3 OR CACHE_L2_DISABLED OR
+     (NOT _probe_diag_mode STREQUAL "M4" AND
+      NOT (CACHE_FULL_PAGE_4CHIP AND CACHE_PAGE_M5_EXPERIMENT AND
+           _probe_diag_mode STREQUAL "M5")) OR NOT CACHE_WATCH_LOG)
+    message(FATAL_ERROR "CACHE_PROBE_MISMATCH_DIAG requires stage 3, watch log and M4 (or explicit full-page M5)")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_PROBE_MISMATCH_DIAG=1)
+endif()
+if(CACHE_PSRAM_BOOT_DIAG)
+  string(TOUPPER "${L2_DIAG_MODE}" _boot_diag_mode)
+  if(CACHE_STAGE LESS 3 OR CACHE_L2_DISABLED OR
+     NOT _boot_diag_mode STREQUAL "M2" OR CACHE_FILL_QUIET_EXPERIMENT OR
+     NOT ENABLE_SD_WRITE_PROTECT OR NOT ENABLE_UART_LOG)
+    message(FATAL_ERROR "CACHE_PSRAM_BOOT_DIAG requires CACHE_STAGE=3, L2 enabled, M2, quiet fill OFF, SD write protect and UART log")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_PSRAM_BOOT_DIAG=1)
+endif()
+if(CACHE_PSRAM_SECTOR0_DIAG)
+  if(NOT CACHE_PSRAM_BOOT_DIAG OR NOT CACHE_BOOT_SECTOR0_SEED)
+    message(FATAL_ERROR "CACHE_PSRAM_SECTOR0_DIAG requires CACHE_PSRAM_BOOT_DIAG and CACHE_BOOT_SECTOR0_SEED")
+  endif()
+  target_compile_definitions(DSpico PRIVATE CACHE_PSRAM_SECTOR0_DIAG=1)
 endif()
 if(L2_LEGACY_PUBLISH_FILL)
   if(CACHE_STAGE LESS 3)
@@ -261,6 +378,15 @@ pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/ntrCardTrace.pio)
 pico_generate_pio_header(DSpico ${CMAKE_CURRENT_LIST_DIR}/src/sd/rp2350_sdio.pio)
 
 if(PSRAM_QUAL_FIRMWARE)
+  if(PSRAM_QUAL_WARM_CYCLES GREATER 0 AND NOT PSRAM_QUAL_FAULT_TEST)
+    message(FATAL_ERROR "PSRAM_QUAL_WARM_CYCLES requires PSRAM_QUAL_FAULT_TEST=ON")
+  endif()
+  if(PSRAM_QUAL_WARM_CYCLES GREATER 0 AND PSRAM_QUAL_FULL)
+    message(FATAL_ERROR "PSRAM_QUAL_WARM_CYCLES uses short regional/fault tests; set PSRAM_QUAL_FULL=OFF")
+  endif()
+  if(PSRAM_QUAL_WARM_CYCLES LESS 0 OR PSRAM_QUAL_WARM_CYCLES GREATER 100)
+    message(FATAL_ERROR "PSRAM_QUAL_WARM_CYCLES must be in 0..100")
+  endif()
   add_executable(PsramQual
     src/psramQualMain.c
     src/psram.c
@@ -274,13 +400,19 @@ if(PSRAM_QUAL_FIRMWARE)
   if(PSRAM_QUAL_FULL)
     target_compile_definitions(PsramQual PRIVATE PSRAM_QUAL_FULL=1)
   endif()
+  if(PSRAM_QUAL_FAULT_TEST)
+    target_compile_definitions(PsramQual PRIVATE PSRAM_QUAL_FAULT_TEST=1)
+  endif()
+  if(PSRAM_QUAL_WARM_CYCLES GREATER 0)
+    target_compile_definitions(PsramQual PRIVATE PSRAM_QUAL_WARM_CYCLES=${PSRAM_QUAL_WARM_CYCLES})
+  endif()
   if(UART_LOG_BUILD_TAG)
     target_compile_definitions(PsramQual PRIVATE UART_LOG_BUILD_TAG="${UART_LOG_BUILD_TAG}")
   endif()
   pico_generate_pio_header(PsramQual ${CMAKE_CURRENT_LIST_DIR}/src/psram.pio)
   pico_enable_stdio_uart(PsramQual 0)
   pico_add_extra_outputs(PsramQual)
-  target_link_libraries(PsramQual pico_stdlib hardware_pio hardware_dma)
+  target_link_libraries(PsramQual pico_stdlib hardware_pio hardware_dma hardware_watchdog)
 endif()
 
 # DSpico is the flash image. Keep host tests, design documents, and the

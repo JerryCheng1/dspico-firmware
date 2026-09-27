@@ -19,6 +19,10 @@ void cacheTextStart(cacheTextStream* s, const char* format, unsigned count);
 int cacheTextNext(cacheTextStream* s); // byte or -1 at end
 void cacheDiagStartLine(cacheTextStream* s, unsigned line, uint32_t sample,
                         const cacheSdCounters* c);
+// One-line user view. Capacity is usable payload, occupancy counts currently
+// valid 512-byte sectors, and the hit denominator counts committed demands.
+void cacheSummaryStartLine(cacheTextStream* s, uint32_t capacity_bytes,
+                           const cacheSdCounters* c);
 
 // Core1-only admission policy. Activity is sampled from existing counters;
 // no writer is added to the cartridge IRQ. This is not a reserved bus window.

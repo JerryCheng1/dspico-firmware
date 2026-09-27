@@ -12,7 +12,7 @@
 // the code halts right after the failure, so f_mount=FAIL is diagnosable.
 // Kept under ENABLE_UART_LOG (boot-time only) independently of the cartridge
 // runtime tracers.
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
 #define SD_LOG(...) do { uartLogPrintfBlocking(__VA_ARGS__); } while (0)
 #else
 #define SD_LOG(...) do { } while (0)

@@ -13,6 +13,9 @@
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
+#ifdef PSRAM_QUAL_WARM_CYCLES
+#include "hardware/watchdog.h"
+#endif
 #include "uartLog.h"
 #include "psram.h"
 
@@ -24,7 +27,53 @@
 #define PSRAM_QUAL_FULL 0
 #endif
 
+#ifndef UART_LOG_BUILD_TAG
+#define UART_LOG_BUILD_TAG "PSRAM_QUAL"
+#endif
+
 #define QUAL_TEST_BYTES 64u
+
+#ifdef PSRAM_QUAL_WARM_CYCLES
+#define QUAL_WARM_MAGIC 0x51574D32u
+static u32 warmCycleAtBoot(void)
+{
+    // SDK watchdog_reboot() uses scratch[4..7]; 0..2 belong to this isolated
+    // qualifier. A non-watchdog start always begins a new sequence.
+    if (!watchdog_caused_reboot() || watchdog_hw->scratch[0] != QUAL_WARM_MAGIC)
+        return 0;
+    u32 cycle = watchdog_hw->scratch[1];
+    if (watchdog_hw->scratch[2] != ~cycle || cycle > PSRAM_QUAL_WARM_CYCLES)
+        return 0;
+    return cycle;
+}
+
+static void warmCycleFinish(u32 cycle, bool passed)
+{
+    if (!passed)
+    {
+        LOG("[psram-reset] cycle=%lu/%u result=FAIL halt=1\n",
+            (unsigned long)cycle, (unsigned)PSRAM_QUAL_WARM_CYCLES);
+        return;
+    }
+    if (cycle == PSRAM_QUAL_WARM_CYCLES)
+    {
+        LOG("[psram-reset] result=WARM_%u_OK completed=%u\n",
+            (unsigned)PSRAM_QUAL_WARM_CYCLES, (unsigned)PSRAM_QUAL_WARM_CYCLES);
+        return;
+    }
+    u32 next = cycle + 1u;
+    watchdog_hw->scratch[0] = QUAL_WARM_MAGIC;
+    watchdog_hw->scratch[1] = next;
+    watchdog_hw->scratch[2] = ~next;
+    LOG("[psram-reset] cycle=%lu/%u result=OK next=watchdog\n",
+        (unsigned long)cycle, (unsigned)PSRAM_QUAL_WARM_CYCLES);
+    psramDeselectAll();
+    busy_wait_ms(20); // let the UART shift register drain before reset
+    watchdog_start_tick(XOSC_MHZ);
+    watchdog_reboot(0, 0, 100);
+    while (1) tight_loop_contents();
+}
+#endif
 
 static void ndsPinsToHighZ(void)
 {
@@ -183,6 +232,12 @@ static bool testChipIsolation(u8* wbuf, u8* rbuf)
         memset(rbuf, 0, QUAL_TEST_BYTES);
         if (!psramRead(chip, probeAddr, rbuf, QUAL_TEST_BYTES))
             allOk = false;
+        else if (memcmp(rbuf, patterns[chip], QUAL_TEST_BYTES) != 0)
+        {
+            LOG("[psram] isolation FAIL chip=%lu own data mismatch\n",
+                (unsigned long)chip);
+            allOk = false;
+        }
         for (u32 other = 0; other < PSRAM_CHIP_COUNT; other++)
         {
             if (other == chip || !gPsramChips[other].present)
@@ -199,26 +254,221 @@ static bool testChipIsolation(u8* wbuf, u8* rbuf)
     return allOk;
 }
 
+static bool testChipTailAndBounds(u32 chip, u8* wbuf, u8* rbuf)
+{
+    const u32 base = PSRAM_SIZE_BYTES - 8u;
+    const u8 initial[8] = { 0xA5, 0x10, 0xC3, 0x7E, 0x29, 0xD4, 0x56, 0xB8 };
+    const u8 patch[3] = { 0x91, 0xE2, 0x3F };
+    const u8 firstByte = 0x4Du;
+    u8 expected[8];
+    memcpy(expected, initial, sizeof(expected));
+
+    bool ok = psramWrite(chip, 0u, &firstByte, 1u);
+    ok = psramWrite(chip, base, initial, sizeof(initial)) && ok;
+    ok = psramWrite(chip, base + 3u, patch, sizeof(patch)) && ok;
+    memcpy(expected + 3u, patch, sizeof(patch));
+    wbuf[0] = 0x6Bu;
+    ok = psramWrite(chip, PSRAM_SIZE_BYTES - 1u, wbuf, 1u) && ok;
+    expected[7] = wbuf[0];
+
+    memset(rbuf, 0, sizeof(expected));
+    ok = psramRead(chip, base, rbuf, sizeof(expected)) && ok;
+    ok = memcmp(rbuf, expected, sizeof(expected)) == 0 && ok;
+    memset(rbuf, 0, sizeof(patch));
+    ok = psramRead(chip, base + 3u, rbuf, sizeof(patch)) && ok;
+    ok = memcmp(rbuf, patch, sizeof(patch)) == 0 && ok;
+    rbuf[0] = 0u;
+    ok = psramRead(chip, 0u, rbuf, 1u) && ok;
+    ok = rbuf[0] == firstByte && ok;
+
+    // Start one byte before a 32-byte boundary, then end with a short tail.
+    // The bytes on either side must survive the mixed PIO/SIO transaction.
+    u8 expectedMiddle[40];
+    u8 patchMiddle[35];
+    for (u32 i = 0; i < sizeof(expectedMiddle); i++)
+        expectedMiddle[i] = (u8)(0x40u + i);
+    for (u32 i = 0; i < sizeof(patchMiddle); i++)
+        patchMiddle[i] = (u8)(0xD3u ^ i);
+    ok = psramWrite(chip, 30u, expectedMiddle, sizeof(expectedMiddle)) && ok;
+    ok = psramWrite(chip, 31u, patchMiddle, sizeof(patchMiddle)) && ok;
+    memcpy(expectedMiddle + 1u, patchMiddle, sizeof(patchMiddle));
+    memset(rbuf, 0, sizeof(expectedMiddle));
+    ok = psramRead(chip, 30u, rbuf, sizeof(expectedMiddle)) && ok;
+    ok = memcmp(rbuf, expectedMiddle, sizeof(expectedMiddle)) == 0 && ok;
+
+    // Invalid operations must be rejected before any CE goes low, including
+    // the UINT32 wraparound case.
+    bool rejectedRead = !psramRead(chip, PSRAM_SIZE_BYTES, rbuf, 1u);
+    bool rejectedWrite = !psramWrite(chip, PSRAM_SIZE_BYTES - 1u, wbuf, 2u);
+    bool rejectedWrap = !psramRead(chip, UINT32_MAX, rbuf, 2u);
+    bool rejected = rejectedRead && rejectedWrite && rejectedWrap;
+    LOG("[psram] chip=%lu tail_frag_exact=%s bounds_reject=%s\n",
+        (unsigned long)chip, ok ? "OK" : "FAIL", rejected ? "OK" : "FAIL");
+    return ok && rejected;
+}
+
+#ifdef PSRAM_QUAL_FAULT_TEST
+static bool testFaultCase(u32 chip, u8 fault, const char* name,
+                          u8* wbuf, u8* rbuf)
+{
+    const u32 addr = 0x600000u + (u32)fault * QUAL_TEST_BYTES;
+    fillPattern(wbuf, QUAL_TEST_BYTES, chip * 17u + fault);
+    bool primed = psramWrite(chip, addr, wbuf, QUAL_TEST_BYTES);
+    if (!primed)
+    {
+        LOG("[psram-fault] chip=%lu case=%s prime=FAIL\n",
+            (unsigned long)chip, name);
+        return false;
+    }
+
+    psramQualInjectFaultOnce(fault);
+    u32 started = time_us_32();
+    bool rejected = fault == PSRAM_QUAL_FAULT_RX_STALL
+        ? !psramRead(chip, addr, rbuf, PSRAM_PIO_FRAG_BYTES)
+        : !psramWrite(chip, addr, wbuf, PSRAM_PIO_FRAG_BYTES);
+    u32 elapsed = time_us_32() - started;
+    bool idle = psramQualBusIdle();
+
+    // The aborted write may have changed its destination. A fresh complete
+    // transaction must restore data, proving that no stale FIFO/DMA state
+    // leaks into the next request.
+    bool recovered = rejected && idle &&
+                     psramWrite(chip, addr, wbuf, QUAL_TEST_BYTES) &&
+                     psramRead(chip, addr, rbuf, QUAL_TEST_BYTES) &&
+                     memcmp(wbuf, rbuf, QUAL_TEST_BYTES) == 0;
+    bool ok = rejected && idle && recovered;
+    LOG("[psram-fault] chip=%lu case=%s rejected=%u idle=%u recovered=%u elapsed_us=%lu result=%s\n",
+        (unsigned long)chip, name, rejected ? 1u : 0u, idle ? 1u : 0u,
+        recovered ? 1u : 0u, (unsigned long)elapsed, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static bool testChipFaultRecovery(u32 chip, u8* wbuf, u8* rbuf)
+{
+    bool rx = testFaultCase(chip, PSRAM_QUAL_FAULT_RX_STALL,
+                            "rx_stall", wbuf, rbuf);
+    bool tx = rx && testFaultCase(chip, PSRAM_QUAL_FAULT_TX_STALL,
+                                  "tx_stall", wbuf, rbuf);
+    bool abort = tx && testFaultCase(chip, PSRAM_QUAL_FAULT_TX_AFTER_DMA,
+                                     "tx_after_dma", wbuf, rbuf);
+    bool cross = false;
+    if (abort)
+    {
+        // Switch CE immediately after a recovered fault. The other chip may
+        // not have been probed yet in this standalone sequence, so reset it
+        // explicitly before comparing its own data.
+        u32 other = (chip + 1u) & (PSRAM_CHIP_COUNT - 1u);
+        psramResetChip(other);
+        fillPattern(wbuf, QUAL_TEST_BYTES, chip * 41u + other);
+        cross = psramWrite(other, 0x600400u, wbuf, QUAL_TEST_BYTES) &&
+                psramRead(other, 0x600400u, rbuf, QUAL_TEST_BYTES) &&
+                memcmp(wbuf, rbuf, QUAL_TEST_BYTES) == 0;
+    }
+    bool ok = rx && tx && abort && cross;
+    LOG("[psram-fault] chip=%lu next_chip=%lu cross_recovery=%s recovery=%s\n",
+        (unsigned long)chip, (unsigned long)((chip + 1u) & (PSRAM_CHIP_COUNT - 1u)),
+        cross ? "OK" : "FAIL", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif
+
 #if PSRAM_QUAL_FULL
+typedef enum {
+    QUAL_ZERO,
+    QUAL_ONES,
+    QUAL_AA,
+    QUAL_55,
+    QUAL_ADDRESS,
+    QUAL_RANDOM,
+    QUAL_PATTERN_COUNT,
+} qualPattern;
+
+static const char* const kPatternNames[QUAL_PATTERN_COUNT] = {
+    "00", "FF", "AA", "55", "address", "random",
+};
+
+static void fullPattern(u8* buf, u32 chip, u32 addr, qualPattern pattern)
+{
+    switch (pattern)
+    {
+    case QUAL_ZERO: memset(buf, 0x00, QUAL_TEST_BYTES); break;
+    case QUAL_ONES: memset(buf, 0xFF, QUAL_TEST_BYTES); break;
+    case QUAL_AA: memset(buf, 0xAA, QUAL_TEST_BYTES); break;
+    case QUAL_55: memset(buf, 0x55, QUAL_TEST_BYTES); break;
+    case QUAL_ADDRESS:
+        for (u32 i = 0; i < QUAL_TEST_BYTES; i += 4)
+        {
+            u32 word = (addr + i) ^ (chip << 24);
+            for (u32 b = 0; b < 4; b++) buf[i + b] = (u8)(word >> (8u * b));
+        }
+        break;
+    case QUAL_RANDOM:
+        fillPattern(buf, QUAL_TEST_BYTES, addr ^ (chip << 24) ^ 0xB5A1634Du);
+        break;
+    default: break;
+    }
+}
+
 static bool testChipFullCapacity(u32 chip, u8* wbuf, u8* rbuf)
 {
-    u32 errors = 0;
-    for (u32 addr = 0; addr < PSRAM_SIZE_BYTES; addr += QUAL_TEST_BYTES)
+    // A write-then-immediate-read loop misses distant address aliases: the
+    // aliased location is overwritten just before it is checked. Write the
+    // ENTIRE chip first, then read it in a separate pass for each pattern.
+    // These are qualification tests, never part of cartridge startup.
+    u32 totalErrors = 0;
+    for (u32 p = 0; p < QUAL_PATTERN_COUNT; p++)
     {
-        if (!verifyRegion(chip, addr, QUAL_TEST_BYTES, gPsramUsePio, gPsramUsePio,
-                          wbuf, rbuf))
+        u32 errors = 0;
+        LOG("[psram] chip=%lu full pattern=%s phase=write begin\n",
+            (unsigned long)chip, kPatternNames[p]);
+        for (u32 addr = 0; addr < PSRAM_SIZE_BYTES; addr += QUAL_TEST_BYTES)
         {
-            if (++errors <= 8)
-                LOG("[psram] chip=%lu full-test error @0x%06lX\n",
-                    (unsigned long)chip, (unsigned long)addr);
+            fullPattern(wbuf, chip, addr, (qualPattern)p);
+            if (!psramWrite(chip, addr, wbuf, QUAL_TEST_BYTES))
+            {
+                LOG("[psram] chip=%lu full pattern=%s write-fail @0x%06lX\n",
+                    (unsigned long)chip, kPatternNames[p], (unsigned long)addr);
+                return false; // transport state is not safe to reuse
+            }
+            if ((addr & 0xFFFFFu) == 0)
+                LOG("[psram] chip=%lu full pattern=%s write 0x%06lX\n",
+                    (unsigned long)chip, kPatternNames[p], (unsigned long)addr);
         }
-        if ((addr & 0xFFFFFu) == 0)
-            LOG("[psram] chip=%lu full-test 0x%06lX\n",
-                (unsigned long)chip, (unsigned long)addr);
+        LOG("[psram] chip=%lu full pattern=%s phase=read begin\n",
+            (unsigned long)chip, kPatternNames[p]);
+        for (u32 addr = 0; addr < PSRAM_SIZE_BYTES; addr += QUAL_TEST_BYTES)
+        {
+            fullPattern(wbuf, chip, addr, (qualPattern)p);
+            if (!psramRead(chip, addr, rbuf, QUAL_TEST_BYTES))
+            {
+                LOG("[psram] chip=%lu full pattern=%s read-fail @0x%06lX\n",
+                    (unsigned long)chip, kPatternNames[p], (unsigned long)addr);
+                return false;
+            }
+            if (memcmp(wbuf, rbuf, QUAL_TEST_BYTES) != 0)
+            {
+                if (errors < 8)
+                {
+                    u32 i = 0;
+                    while (i < QUAL_TEST_BYTES && wbuf[i] == rbuf[i]) i++;
+                    LOG("[psram] chip=%lu full pattern=%s mismatch @0x%06lX exp=%02X got=%02X\n",
+                        (unsigned long)chip, kPatternNames[p], (unsigned long)(addr + i),
+                        wbuf[i], rbuf[i]);
+                }
+                errors++;
+            }
+            if ((addr & 0xFFFFFu) == 0)
+                LOG("[psram] chip=%lu full pattern=%s read 0x%06lX\n",
+                    (unsigned long)chip, kPatternNames[p], (unsigned long)addr);
+        }
+        LOG("[psram] chip=%lu full pattern=%s errors=%lu\n",
+            (unsigned long)chip, kPatternNames[p], (unsigned long)errors);
+        totalErrors += errors;
     }
-    LOG("[psram] chip=%lu full capacity errors=%lu\n",
-        (unsigned long)chip, (unsigned long)errors);
-    return errors == 0;
+    LOG("[psram] chip=%lu full capacity bytes=%lu patterns=%u errors=%lu\n",
+        (unsigned long)chip, (unsigned long)PSRAM_SIZE_BYTES,
+        (unsigned)QUAL_PATTERN_COUNT, (unsigned long)totalErrors);
+    return totalErrors == 0;
 }
 #endif
 
@@ -230,7 +480,13 @@ int main(void)
 
     uartLogInit();
     LOG("\n[boot] build=%s stage=S2 qual=1 sys_khz=%lu\n",
-        "PSRAM_QUAL", (unsigned long)(clock_get_hz(clk_sys) / 1000u));
+        UART_LOG_BUILD_TAG, (unsigned long)(clock_get_hz(clk_sys) / 1000u));
+#ifdef PSRAM_QUAL_WARM_CYCLES
+    u32 warmCycle = warmCycleAtBoot();
+    LOG("[psram-reset] cycle=%lu/%u cause=%s\n", (unsigned long)warmCycle,
+        (unsigned)PSRAM_QUAL_WARM_CYCLES,
+        watchdog_caused_reboot() ? "watchdog" : "non_watchdog");
+#endif
 
     ndsPinsToHighZ();
     psramGpioInit();
@@ -250,6 +506,10 @@ int main(void)
     static u8 wbuf[QUAL_TEST_BYTES] __attribute__((aligned(4)));
     static u8 rbuf[QUAL_TEST_BYTES] __attribute__((aligned(4)));
     u32 presentMask = 0;
+    u32 qualifiedMask = 0;
+#ifdef PSRAM_QUAL_FAULT_TEST
+    u32 faultMask = 0;
+#endif
 
     for (u32 chip = 0; chip < PSRAM_CHIP_COUNT; chip++)
     {
@@ -270,30 +530,73 @@ int main(void)
         LOG(" mf=0x%02lX kgd=0x%02lX size=%lu\n",
             (unsigned long)mf, (unsigned long)kgd, (unsigned long)size);
 
-        bool ok = testChipRegions(chip, wbuf, rbuf);
+        bool regionsOk = testChipRegions(chip, wbuf, rbuf);
         bool anySpeed = gPsramUsePio ? sweepPioSpeeds(chip, wbuf, rbuf) : false;
-        gPsramChips[chip].quadWriteOk = ok || anySpeed;
-        gPsramChips[chip].quadReadOk = ok || anySpeed;
-        gPsramChips[chip].present = ok || anySpeed || gPsramChips[chip].idValid;
+        bool runtimeSpeedOk = gPsramUsePio && pioRegionsPass(chip, wbuf, rbuf);
+        bool tailBoundsOk = testChipTailAndBounds(chip, wbuf, rbuf);
+#ifdef PSRAM_QUAL_FAULT_TEST
+        bool faultOk = engine && runtimeSpeedOk &&
+                       testChipFaultRecovery(chip, wbuf, rbuf);
+        if (!faultOk)
+        {
+            LOG("[psram-fault] chip=%lu HALT after failed recovery\n",
+                (unsigned long)chip);
+            psramDeselectAll();
+            while (1)
+                tight_loop_contents();
+        }
+        if (faultOk)
+            faultMask |= 1u << chip;
+#endif
+        gPsramChips[chip].quadWriteOk = regionsOk && runtimeSpeedOk;
+        gPsramChips[chip].quadReadOk = regionsOk && runtimeSpeedOk;
+        gPsramChips[chip].present = regionsOk || anySpeed || gPsramChips[chip].idValid;
         if (gPsramChips[chip].present)
             presentMask |= (1u << chip);
 
+        bool regionRuntimeOk = engine && gPsramChips[chip].idValid &&
+                               size == PSRAM_SIZE_BYTES && regionsOk && runtimeSpeedOk &&
+                               tailBoundsOk;
+#ifdef PSRAM_QUAL_FAULT_TEST
+        regionRuntimeOk = regionRuntimeOk && faultOk;
+#endif
 #if PSRAM_QUAL_FULL
-        if (gPsramChips[chip].present)
-            ok = testChipFullCapacity(chip, wbuf, rbuf) && ok;
+        bool fullOk = regionRuntimeOk && testChipFullCapacity(chip, wbuf, rbuf);
+        if (fullOk)
+            qualifiedMask |= (1u << chip);
 #endif
 
-        LOG("[psram] chip=%lu result=%s\n", (unsigned long)chip,
-            ok ? "OK" : (gPsramChips[chip].present ? "FAIL" : "ABSENT"));
+        LOG("[psram] chip=%lu region_runtime=%s full=%s\n", (unsigned long)chip,
+            regionRuntimeOk ? "OK" : "FAIL",
+#if PSRAM_QUAL_FULL
+            fullOk ? "OK" : "FAIL");
+#else
+            "NOT_RUN");
+#endif
         psramDeselectAll();
     }
 
-    if (presentMask)
-        testChipIsolation(wbuf, rbuf);
+    bool isolated = presentMask && testChipIsolation(wbuf, rbuf);
+#ifdef PSRAM_QUAL_FAULT_TEST
+    LOG("[psram-fault] result=%s mask=%lX\n",
+        faultMask == 0xFu ? "FOUR_CHIP_OK" : "FAIL", (unsigned long)faultMask);
+#endif
+    if (!isolated)
+        qualifiedMask = 0; // one CE alias invalidates the entire shared-bus profile
 
-    LOG("[cache] init local_result=%s usable_mask=%lX\n",
-        presentMask == 0xFu ? "FULL_4CHIP" : (presentMask ? "DEGRADED" : "CACHE_OFF"),
-        (unsigned long)presentMask);
+    LOG("[cache] qual result=%s present_mask=%lX qualified_mask=%lX isolated=%u tested_bytes=%lu\n",
+#if PSRAM_QUAL_FULL
+        qualifiedMask == 0xFu ? "FULL_4CHIP" : (qualifiedMask ? "DEGRADED" : "FAIL"),
+        (unsigned long)presentMask, (unsigned long)qualifiedMask, isolated ? 1u : 0u,
+        (unsigned long)(PSRAM_SIZE_BYTES * __builtin_popcount(qualifiedMask)));
+#else
+        "REGION_ONLY", (unsigned long)presentMask, 0ul, isolated ? 1u : 0u, 0ul);
+#endif
+
+#ifdef PSRAM_QUAL_WARM_CYCLES
+    warmCycleFinish(warmCycle, engine && presentMask == 0xFu &&
+                    faultMask == 0xFu && isolated);
+#endif
 
     while (1)
     {

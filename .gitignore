@@ -6,6 +6,9 @@ build*/
 cmake-build*/
 out/
 test*/
+# Local host regressions and experimental documentation are not firmware sources.
+/tests/
+/docs/
 
 # Compiled source #
 ###################

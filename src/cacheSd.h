@@ -20,7 +20,9 @@
 #define CACHE_SD_ENABLED 0
 #endif
 
-// 4096 sectors x 512 B = 2 MiB of PSRAM data spread over the four devices.
+// Legacy sector-index backend size (2 MiB). The full-page backend has its own
+// CACHE_PAGE_ACTIVE_SETS layout in cachePageMap.h and does not use this value
+// as its capacity limit.
 #define CACHE_SD_SECTORS 4096u
 #define PSRAM_CACHE_FRAG_BYTES 32u
 
@@ -85,10 +87,25 @@ typedef struct
     // Runtime diagnostics: approximate cross-core samples, not a transaction.
     uint32_t mode, enabled, degraded, epoch, sd_miss;
     uint32_t demand_hit_try, demand_hit_ok, probe_try, probe_ok;
+    uint32_t demand_non_psram_ok; // committed SD/boot-seed responses, for hit-rate denominator
     uint32_t read_bytes, write_bytes; // successful transport fragments, cumulative
     uint32_t fill_state, fill_sector, fill_offset, snapshot;
     uint32_t gate_checks, gate_blocked, gate_mask; // WATCH/HOST; 1/1024 steps sampled
     uint32_t gate_measured; // 0: only a software-state observation; counts unavailable
+    uint32_t quiet_fill_fragments, quiet_fill_max_us;
+    uint32_t quiet_irq_overlap, quiet_e5_overlap;
+    uint32_t boot_seed_use; // sector-0 demand published from boot prewarm
+    uint32_t probe_first_valid, probe_first_sector, probe_first_offset;
+    uint32_t probe_first_expected, probe_first_actual;
+    uint32_t probe_first_ref_crc, probe_first_tag_crc;
+    // Experimental four-chip shadow: each bit represents a verified 512 KiB
+    // stripe within that chip's 8 MiB address range. Zero when disabled.
+    uint32_t shadow_banks[4];
+    uint32_t shadow_verify[4];
+    // Full 4 KiB page backend: completed fills/probes and verified demand hits
+    // per physical chip, plus the highest set committed. Zero when disabled.
+    uint32_t page_fill[4], page_probe[4], page_hit_ok[4], page_max_set[4];
+    uint32_t page_valid_sectors;
 } cacheSdCounters;
 
 enum {
@@ -105,7 +122,14 @@ typedef struct { uint32_t sends, sector, head, tail, offer; } cacheSdTxSnapshot;
 
 void cacheSdSetHw(const cacheSdHw* hw);
 void cacheSdInit(void);
+// Core0 boot only, after a completed and verified sector-0 SD read. The copy
+// is kept independently until the first sector-0 demand or a medium/write change.
+void cacheSdSeedBootSector0(const uint8_t* data);
 void cacheSdSetEnabled(bool enabled);
+// IRQ-only activity timestamp for the opt-in M3/M4 quiet transport experiment.
+enum { CACHE_HOST_CMD_E3 = 1, CACHE_HOST_CMD_E4 = 2,
+       CACHE_HOST_CMD_E5 = 3, CACHE_HOST_CMD_F6 = 4 };
+void cacheSdNoteHostCommandFromIrq(uint8_t kind);
 
 // Diagnostic mode (design section 10). M0/M1 isolate bring-up, M2 the snapshot
 // cost, M3 the backfill coexistence, M4 the transfer/generation check and M5
@@ -215,7 +239,9 @@ static inline void cacheSdRecordSendFromIrq(uint32_t s, const uint8_t* d) { (voi
 static inline const volatile cacheSdTxSnapshot* cacheSdLastTx(void) { return 0; }
 static inline void cacheSdSetHw(const cacheSdHw* hw) { (void)hw; }
 static inline void cacheSdInit(void) {}
+static inline void cacheSdSeedBootSector0(const uint8_t* data) { (void)data; }
 static inline void cacheSdSetEnabled(bool e) { (void)e; }
+static inline void cacheSdNoteHostCommandFromIrq(uint8_t kind) { (void)kind; }
 static inline void cacheSdSetMode(uint8_t m) { (void)m; }
 static inline uint8_t cacheSdMode(void) { return 0; }
 static inline void cacheSdSetTimeBudgets(uint32_t a, uint32_t b, uint32_t c, uint32_t d) { (void)a; (void)b; (void)c; (void)d; }

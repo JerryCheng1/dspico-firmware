@@ -92,9 +92,11 @@ void uartLogInit(void)
     // Earliest possible wire-level self-test. It intentionally bypasses the
     // asynchronous log ring, both cores and PSRAM qualification. Seeing this
     // line proves that the UART clock, peripheral, Bank-1 mux and TX pad work.
+#ifndef CACHE_SUMMARY_LOG
     uart_puts(uart1, "\r\n[UART] RP2354A UART1 ready: USB_DP TX, 115200 8N1; build="
                      UART_LOG_BUILD_TAG "\r\n");
     uart_tx_wait_blocking(uart1);
+#endif
 }
 
 void uartLogPutsBlocking(const char* text)

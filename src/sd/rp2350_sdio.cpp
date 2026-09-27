@@ -941,7 +941,7 @@ void rp2350_sdio_init(int clock_divider)
     irq_set_exclusive_handler(DMA_IRQ_1, rp2350_sdio_irq);
     irq_set_enabled(DMA_IRQ_1, true);
 
-#ifdef ENABLE_UART_LOG
+#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
     // Frequency probe: SD_CLK = clk_sys / (sm_clkdiv * PIO_CLKDIV=8). The
     // upstream RP2040 build runs the identical 200 MHz / CLKDIV=8 / div=62->1
     // scheme, so this must print ~403 kHz at init and 25000 kHz after CMD3.
