@@ -10,15 +10,14 @@
 ; - Default speed: max. 25 MHz clock
 ; - High speed:    max. 50 MHz clock
 ;
-; The RP2354A build runs clk_sys at 200 MHz. CLKDIV=8 below produces a
-; 25 MHz SD clock; the CPU applies a further state-machine divider during the
-; initial handshake.
+; In this isolated 150 MHz trial, CLKDIV=6 gives the same 25 MHz transfer
+; clock and approximately 403 kHz initialization clock as the 200 MHz build.
 ;
 ; Because data is written on the falling edge and read on the rising
 ; edge, it is preferrable to have a long 0 state and short 1 state.
 ;.define CLKDIV 3
 ; .define CLKDIV 5
-.define CLKDIV 8
+.define CLKDIV 6
 .define D0 ((CLKDIV + 1) / 2 - 1)
 .define D1 (CLKDIV/2 - 1)
 .define SDIO_CLK_GPIO 3

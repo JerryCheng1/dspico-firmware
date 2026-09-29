@@ -83,10 +83,34 @@ volatile u32 gCartSdE4LenArmed;
 // instead of relying on the bare flag.
 static u32 sCartTxGen = 1;
 static u32 sCartSdE4LenGen;
+#if CACHE_STAGE >= 3
+// The next E4 response is queued while the preceding command is still active.
+static u32 sCartSdE4StatusPipelined;
+static u32 sCartSdE4PipelinedReady;
+#endif
 // Diagnostics: times a pre-armed length had to be dropped while the RX FIFO
 // was not empty (design section 6.3 / L06).
 volatile u32 gCartSdFifoRecovery;
 volatile u32 gCartSdRecoveryPending;
+#ifdef CART_RECOVERY_DIAG
+extern "C" {
+volatile u32 gCartFirstPrearmCmd;
+volatile u32 gCartFirstPrearmWord;
+volatile u32 gCartFirstPrearmPc;
+volatile u32 gCartFirstPrearmTx;
+}
+// This runs only after a response-queue conflict. Keep the snapshot outside
+// the small scratch-Y IRQ code section used by the normal command handlers.
+static __attribute__((noinline)) void cartLogFirstPrearm(void)
+{
+    if (gCartSdFifoRecovery)
+        return;
+    gCartFirstPrearmCmd = gNtrRomEmu.cmd0;
+    gCartFirstPrearmWord = gNtrRomEmu.wordIdx;
+    gCartFirstPrearmPc = pio_sm_get_pc(pio0, 0);
+    gCartFirstPrearmTx = pio_sm_get_tx_fifo_level(pio0, 0);
+}
+#endif
 
 static inline void cartTxBegin(void)
 {
@@ -101,6 +125,9 @@ extern "C" void ntrc_cartBumpTxGen(void)
     cartTxBegin();
     gCartSdE4LenArmed = 0;
     gCartSdRecoveryPending = 0;
+#if CACHE_STAGE >= 3
+    sCartSdE4StatusPipelined = 0;
+#endif
 }
 
 extern "C" u32 ntrc_cartTxGen(void) { return sCartTxGen; }
@@ -115,6 +142,9 @@ static inline bool cartRejectPrearm(void)
         return true;
     if (!gCartSdE4LenArmed)
         return false;
+#ifdef CART_RECOVERY_DIAG
+    cartLogFirstPrearm();
+#endif
     gCartSdRecoveryPending = 1;
     gCartSdFifoRecovery++;
     return true;
@@ -190,6 +220,21 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameReqSdReadCmd1)(ntr_rom_emu_t* romEm
         return;
     }
 
+#if CACHE_STAGE >= 3
+    // The first E4 may follow this final E3 command word before a 150 MHz
+    // dispatch can supply its status byte. A conservative busy response is
+    // already valid; the E4 handler will pipeline the next sampled status.
+    if (!sWriteBusy)
+    {
+        ntrc_beginWrite(pio, 4);
+        ntrc_writeWord(pio, 0);
+        sCartSdE4LenGen = sCartTxGen;
+        sCartSdE4PipelinedReady = 0;
+        sCartSdE4StatusPipelined = 1;
+        gCartSdE4LenArmed = 1;
+    }
+#endif
+
     sCurSdSector = 0xFFFFFFFF;
     sReadSector = word;
 #if CACHE_STAGE >= 3
@@ -225,6 +270,35 @@ extern "C" void __scratch_y("cpu0")(ntrc_gameGetSdStatCmd0)(ntr_rom_emu_t* romEm
         ntrc_finishGameNoScrambleCmd0(romEmu);
         return;
     }
+#if CACHE_STAGE >= 3
+    if (sCartSdE4StatusPipelined && !sWriteBusy)
+    {
+        // This poll's byte was queued by E3 or the preceding busy poll.
+        // Bind only the ready value actually offered to the host, while the
+        // next poll's length and status are placed in FIFO before bookkeeping.
+        const bool queuedReady = sCartSdE4PipelinedReady != 0;
+        if (queuedReady)
+        {
+            gCartSdE4LenArmed = 0;
+            sCartSdE4StatusPipelined = 0;
+        }
+        else
+        {
+            const bool nextReady = gCacheSdReadReady != 0;
+            ntrc_beginWrite(pio, 4);
+            ntrc_writeWord(pio, nextReady ? 1 : 0);
+            sCartSdE4PipelinedReady = nextReady ? 1u : 0u;
+            sCartSdE4LenGen = sCartTxGen;
+            gCartSdE4LenArmed = 1;
+        }
+        (void)cacheSdPollReadySampled(queuedReady);
+        ntrc_finishGameNoScrambleCmd0(romEmu);
+#ifdef CACHE_FILL_QUIET_EXPERIMENT
+        cacheSdNoteHostCommandFromIrq(CACHE_HOST_CMD_E4);
+#endif
+        return;
+    }
+#endif
     if (!gCartSdE4LenArmed)
         ntrc_beginWrite(pio, 4);
 

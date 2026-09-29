@@ -382,6 +382,39 @@ bool psramSelfTest(void)
     return true;
 }
 
+#ifdef PSRAM_BOOT_AUTOSWEEP
+bool psramCrossSelfTest(void)
+{
+    if (sRuntimeState < PSRAM_STATE_DEVICE_READY)
+        return false;
+
+    u8 pattern[PSRAM_SELFTEST_BYTES];
+    u8 readback[PSRAM_SELFTEST_BYTES];
+    for (u32 c = 0; c < PSRAM_CHIP_COUNT; c++)
+    {
+        if (!gPsramChips[c].present)
+            return false;
+
+        // Verify the PIO write with an independent SIO read.
+        for (u32 i = 0; i < PSRAM_SELFTEST_BYTES; i++)
+            pattern[i] = (u8)(0x5Au ^ (u8)(c * 0x13u) ^ (u8)(i * 7u));
+        if (!psramWrite(c, PSRAM_SELFTEST_ADDR, pattern, sizeof(pattern)) ||
+            !psramBitBangRead(c, PSRAM_SELFTEST_ADDR, readback, sizeof(readback)) ||
+            memcmp(pattern, readback, sizeof(pattern)) != 0)
+            return false;
+
+        // Verify the PIO read after an independent SIO write.
+        for (u32 i = 0; i < PSRAM_SELFTEST_BYTES; i++)
+            pattern[i] = (u8)(0xC3u ^ (u8)(c * 0x29u) ^ (u8)(i * 11u));
+        if (!psramBitBangWrite(c, PSRAM_SELFTEST_ADDR, pattern, sizeof(pattern)) ||
+            !psramRead(c, PSRAM_SELFTEST_ADDR, readback, sizeof(readback)) ||
+            memcmp(pattern, readback, sizeof(pattern)) != 0)
+            return false;
+    }
+    return true;
+}
+#endif
+
 #ifdef CACHE_PSRAM_BOOT_DIAG
 static psramCacheWindowDiag psramCacheWindowCompare(const u8 source[512], bool sioWrite)
 {

@@ -941,16 +941,20 @@ void rp2350_sdio_init(int clock_divider)
     irq_set_exclusive_handler(DMA_IRQ_1, rp2350_sdio_irq);
     irq_set_enabled(DMA_IRQ_1, true);
 
-#if defined(ENABLE_UART_LOG) && !defined(CACHE_SUMMARY_LOG)
-    // Frequency probe: SD_CLK = clk_sys / (sm_clkdiv * PIO_CLKDIV=8). The
-    // upstream RP2040 build runs the identical 200 MHz / CLKDIV=8 / div=62->1
-    // scheme, so this must print ~403 kHz at init and 25000 kHz after CMD3.
+#if defined(ENABLE_UART_LOG)
+    // SDIO PIO program uses six instructions per SD clock period.
     {
         uint32_t sysHz = clock_get_hz(clk_sys);
-        uint32_t sdKhz = sysHz / 1000u / ((uint32_t)clock_divider * 8u);
+        uint32_t sdKhz = sysHz / 1000u / ((uint32_t)clock_divider * 6u);
+#if defined(CACHE_SUMMARY_LOG)
+        uartLogPrintfBlocking("[clock] sdio_%s=%lukHz (pio_div=%d)\n",
+                              clock_divider == 1 ? "run" : "init",
+                              (unsigned long)sdKhz, clock_divider);
+#else
         uartLogPrintfBlocking(
             "[SDIO] init sm_div=%d clk_sys=%lu Hz -> SD_CLK=%lu kHz\n",
             clock_divider, (unsigned long)sysHz, (unsigned long)sdKhz);
+#endif
     }
 #endif
 }

@@ -59,6 +59,14 @@ extern "C" volatile u32 gCartSdFifoRecovery;
 #endif
 
 static u32 sProgramOffset;
+#ifdef CART_RECOVERY_DIAG
+extern "C" volatile u32 gCartFirstPrearmCmd;
+extern "C" volatile u32 gCartFirstPrearmWord;
+extern "C" volatile u32 gCartFirstPrearmPc;
+extern "C" volatile u32 gCartFirstPrearmTx;
+static volatile u32 sFirstRecoveryCount, sFirstRecoveryCmd;
+static volatile u32 sFirstRecoveryPc, sFirstRecoveryTx;
+#endif
 FATFS sFatFs;
 SdCard gSdCard;
 static bool sIsSdCardMounted;
@@ -286,6 +294,16 @@ static void cacheWatchPoll(void)
     stream.values[field++] = (uint32_t)(gpio_get(PIN_CS2));
     stream.values[field++] = (uint32_t)(pio_sm_get_pc(pio0, 0));
     stream.values[field++] = (uint32_t)(pio_sm_get_pc(pio0, 0) - sProgramOffset);
+#ifdef CART_RECOVERY_DIAG
+    stream.values[field++] = (uint32_t)(gCartFirstPrearmCmd);
+    stream.values[field++] = (uint32_t)(gCartFirstPrearmWord);
+    stream.values[field++] = (uint32_t)(gCartFirstPrearmPc - sProgramOffset);
+    stream.values[field++] = (uint32_t)(gCartFirstPrearmTx);
+    stream.values[field++] = (uint32_t)(sFirstRecoveryCount);
+    stream.values[field++] = (uint32_t)(sFirstRecoveryCmd);
+    stream.values[field++] = (uint32_t)(sFirstRecoveryPc);
+    stream.values[field++] = (uint32_t)(sFirstRecoveryTx);
+#endif
     stream.values[field++] = (uint32_t)(cs->intent.sector);
     stream.values[field++] = (uint32_t)(flags);
     stream.values[field++] = (uint32_t)(gCacheSdReadReady);
@@ -335,7 +353,11 @@ static void cacheWatchPoll(void)
 #else
         "marks=0 "
 #endif
-        "l2=%u sd=%d sec=%08lX done=%lu/%lu ceb=%u cs2=%u pc=%lu rel=%lu\n"
+        "l2=%u sd=%d sec=%08lX done=%lu/%lu ceb=%u cs2=%u pc=%lu rel=%lu"
+#ifdef CART_RECOVERY_DIAG
+        " prearm=%08lX/%lu/%lu/%lu recover=%lu/%08lX/%lu/%lu"
+#endif
+        "\n"
         "[watch] req=%08lX flags=%02lX ready=%lu proto=%lu retry=%lu fault=%lu err=%lu io=%lu/%lu/%lu/%lu dma=%u%u cmd=%08lX wi=%lu e4=%lu\n"
         "[watch] offer=%lu ack=%lu e4=%lu/%lu/%lu e5=%lu/%lu first=%u seq=%lu sampled=%lu fill=%lu hitTry=%lu fifo=%lu pending=%lu\n"
         "[tx] n=%lu sec=%08lX offer=%lu head=%08lX tail=%08lX"
@@ -473,6 +495,15 @@ static void __time_critical_func(gpioIrq)(uint gpio, u32 events)
                 irq_set_enabled(PIO0_IRQ_0, true);
                 return;
             }
+#ifdef CART_RECOVERY_DIAG
+            if (!sFirstRecoveryCount)
+            {
+                sFirstRecoveryCmd = gNtrRomEmu.cmd0;
+                sFirstRecoveryPc = relPc;
+                sFirstRecoveryTx = pio_sm_get_tx_fifo_level(pio0, 0);
+            }
+            sFirstRecoveryCount++;
+#endif
 #ifdef CACHE_WATCH_ACTIVE_MARKERS
             sWatchRecoverCmd = gNtrRomEmu.cmd0;
             sWatchRecoverPc = pio_sm_get_pc(pio0, 0) - sProgramOffset;
@@ -745,7 +776,7 @@ int __time_critical_func(main)()
     // the RP2350 PLL path. The cartridge IRQ timing was designed at 200 MHz.
     vreg_set_voltage(VREG_VOLTAGE_1_15);
     sleep_us(100);
-    set_sys_clock_khz(200000, true);
+    set_sys_clock_khz(150000, true);
 #ifdef ENABLE_UART_LOG
     uartLogInit();
 #endif
@@ -811,7 +842,38 @@ int __time_critical_func(main)()
                         || l2Mode == CACHE_L2_MODE_M2
 #endif
                        ))
+#ifdef PSRAM_BOOT_AUTOSWEEP
+            {
+                // Use the first divider that survives the existing four-chip
+                // PIO self-test and an independent SIO/PIO cross-check.
+                // 3.0 is the previously stable setting and bounds boot time.
+                for (u32 tenth = 10u; tenth <= 30u; tenth++)
+                {
+                    psramSetClockDiv((float)tenth / 10.0f);
+                    const bool basic = psramSelfTest();
+                    const bool cross = basic && psramCrossSelfTest();
+                    const u32 div256 = pio2->sm[0].clkdiv >> 8;
+                    const u32 pioKhz = div256 ?
+                        ((clock_get_hz(clk_sys) / 1000u) * 256u + div256 / 2u) / div256 : 0u;
+                    uartLogPrintfBlocking(
+                        "[psram-sweep] div=%lu.%lu actual=%lu.%03lu cmd=%lukHz read=%lukHz write=%lukHz self=%u cross=%u\n",
+                        (unsigned long)(tenth / 10u), (unsigned long)(tenth % 10u),
+                        (unsigned long)(div256 / 256u),
+                        (unsigned long)((div256 % 256u) * 1000u / 256u),
+                        (unsigned long)(pioKhz / 2u),
+                        (unsigned long)(pioKhz / 3u),
+                        (unsigned long)(pioKhz / 3u),
+                        (unsigned)basic, (unsigned)cross);
+                    if (cross)
+                    {
+                        selftest = true;
+                        break;
+                    }
+                }
+            }
+#else
                 selftest = psramSelfTest();
+#endif
 #ifdef CACHE_PSRAM_BOOT_DIAG
             psramCacheWindowDiag lowDiag = {};
             if (selftest)
@@ -830,6 +892,19 @@ int __time_critical_func(main)()
             if (enabled)
                 psramSetRuntimeEnabled(true);
             cacheSdSetEnabled(enabled);
+#ifdef PSRAM_BOOT_AUTOSWEEP
+            if (selftest)
+            {
+                const u32 div256 = pio2->sm[0].clkdiv >> 8;
+                uartLogPrintfBlocking("[psram-sweep] selected=%lu.%03lu enabled=%u mask=%02lX\n",
+                    (unsigned long)(div256 / 256u),
+                    (unsigned long)((div256 % 256u) * 1000u / 256u),
+                    (unsigned)enabled, (unsigned long)devMask);
+            }
+            else
+                uartLogPrintfBlocking("[psram-sweep] selected=none enabled=0 mask=%02lX\n",
+                    (unsigned long)devMask);
+#endif
         }
 #ifdef CACHE_WATCH_LOG
         sWatchL2 = enabled;
@@ -950,6 +1025,32 @@ int __time_critical_func(main)()
     // E3/E4 answers ready immediately instead of storming. See
     // ntrc_gameSdPrewarm in ntrCardRomGameSd.cpp.
     ntrc_gameSdPrewarm();
+
+#if defined(ENABLE_UART_LOG) && defined(CACHE_SUMMARY_LOG)
+    // Boot-only clock report. Keep the runtime UART on core1's idle-gated
+    // cache summary path so this cannot delay cartridge command handling.
+    {
+        const u32 sysKhz = clock_get_hz(clk_sys) / 1000u;
+        const u32 psramDiv256 = pio2->sm[0].clkdiv >> 8;
+        const u32 psramPioKhz = psramDiv256 ?
+            (sysKhz * 256u + psramDiv256 / 2u) / psramDiv256 : 0u;
+        uartLogPrintfBlocking(
+            "[clock] ref=%lukHz sys=%lukHz peri=%lukHz hstx=%lukHz usb=%lukHz adc=%lukHz\n",
+            (unsigned long)(clock_get_hz(clk_ref) / 1000u),
+            (unsigned long)sysKhz,
+            (unsigned long)(clock_get_hz(clk_peri) / 1000u),
+            (unsigned long)(clock_get_hz(clk_hstx) / 1000u),
+            (unsigned long)(clock_get_hz(clk_usb) / 1000u),
+            (unsigned long)(clock_get_hz(clk_adc) / 1000u));
+        uartLogPrintfBlocking(
+            "[clock] cart_pio=%lukHz psram_pio=%lukHz psram_cmd=%lukHz psram_read=%lukHz psram_write=%lukHz uart=115200bps\n",
+            (unsigned long)sysKhz, // PIO0 SM0 divider is 1.
+            (unsigned long)psramPioKhz,
+            (unsigned long)(psramPioKhz / 2u),
+            (unsigned long)(psramPioKhz / 3u),
+            (unsigned long)(psramPioKhz / 3u));
+    }
+#endif
 
 
     pwr_initPowerSaving();

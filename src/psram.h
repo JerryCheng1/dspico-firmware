@@ -83,6 +83,10 @@ bool psramInitDevice(void);
 // Write/read-back an isolated block (never a live cache entry). Bounded by the
 // transport spin limit; sets SELFTEST_OK only on a full compare.
 bool psramSelfTest(void);
+#ifdef PSRAM_BOOT_AUTOSWEEP
+// Independent SIO/PIO cross-check of each chip's isolated self-test block.
+bool psramCrossSelfTest(void);
+#endif
 #ifdef CACHE_PSRAM_BOOT_DIAG
 typedef struct
 {
