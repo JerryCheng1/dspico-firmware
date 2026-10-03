@@ -40,10 +40,13 @@
 // PIO2 SCLK generation. Every PSRAM phase (command, address, dummy, read
 // data, write data) now runs 2 SM cycles per bit/nibble, so all edges are
 // sysclk / (2 * div) and the settling/hold per edge is exactly one SM cycle
-// (div / sysclk). The board's proven limit is ~10 ns per edge: at 200 MHz the
-// qual sweep proved div=2, at 150 MHz the boot sweep selects div=1.5 (50 MHz
-// edges). This constant is only the initial value; PSRAM_BOOT_AUTOSWEEP or
-// the qualification sweep re-tunes it, and unvalidated builds stay on 3.0.
+// (div / sysclk). The board's proven limit is 10 ns per edge: the 200 MHz
+// qual sweep measured div=1.5 (7.5 ns) passing only on U2 while U4/U5/U6
+// fail (reads shift by one whole nibble at div=1.0), so 10 ns is the
+// four-chip ceiling and div=2/200 MHz == div=1.5/150 MHz (50 MHz edges) is
+// the fastest safe operating point. This constant is only the initial value;
+// PSRAM_BOOT_AUTOSWEEP or the qualification sweep re-tunes it, and
+// unvalidated builds stay on 3.0.
 #define PSRAM_PIO_CLKDIV 3.0f
 
 typedef struct
