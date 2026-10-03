@@ -845,9 +845,12 @@ int __time_critical_func(main)()
 #ifdef PSRAM_BOOT_AUTOSWEEP
             {
                 // Use the first divider that survives the existing four-chip
-                // PIO self-test and an independent SIO/PIO cross-check.
-                // 3.0 is the previously stable setting and bounds boot time.
-                for (u32 tenth = 10u; tenth <= 30u; tenth++)
+                // PIO self-test and an independent SIO/PIO cross-check. The
+                // data phases are 2 SM cycles per nibble, so div=1.5 on a
+                // 150 MHz sysclk keeps every PSRAM edge (command, address,
+                // dummy, read, write) at the proven 50 MHz / 10 ns envelope;
+                // faster dividers would push edges past it and are not tried.
+                for (u32 tenth = 15u; tenth <= 30u; tenth++)
                 {
                     psramSetClockDiv((float)tenth / 10.0f);
                     const bool basic = psramSelfTest();
@@ -861,8 +864,8 @@ int __time_critical_func(main)()
                         (unsigned long)(div256 / 256u),
                         (unsigned long)((div256 % 256u) * 1000u / 256u),
                         (unsigned long)(pioKhz / 2u),
-                        (unsigned long)(pioKhz / 3u),
-                        (unsigned long)(pioKhz / 3u),
+                        (unsigned long)(pioKhz / 2u),
+                        (unsigned long)(pioKhz / 2u),
                         (unsigned)basic, (unsigned)cross);
                     if (cross)
                     {
@@ -1047,8 +1050,8 @@ int __time_critical_func(main)()
             (unsigned long)sysKhz, // PIO0 SM0 divider is 1.
             (unsigned long)psramPioKhz,
             (unsigned long)(psramPioKhz / 2u),
-            (unsigned long)(psramPioKhz / 3u),
-            (unsigned long)(psramPioKhz / 3u));
+            (unsigned long)(psramPioKhz / 2u),
+            (unsigned long)(psramPioKhz / 2u));
     }
 #endif
 

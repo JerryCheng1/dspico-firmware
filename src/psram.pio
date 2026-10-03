@@ -16,16 +16,60 @@
 ; defines the SCLK level and no instruction can leave it floating. CPOL=0,
 ; CPHA=0: data is driven while SCLK is low and sampled on the rising edge.
 ;
+; Data-phase geometry: 2 SM cycles per nibble in both directions, so every
+; PSRAM phase (command, address, dummy, read data, write data) runs at
+; sysclk / (2 * div) with the same absolute margins:
+;   read : SCLK rises at the end of "nop side 1"; the input synchronizer is
+;          bypassed (psramEngineInit), so "in pins, 4" samples at the end of
+;          the next cycle - exactly one SM cycle after the rising edge and
+;          one SM cycle before the next one. At div=1.5 on a 150 MHz sysclk
+;          that is the same 10 ns settling/hold the 200 MHz div=2
+;          qualification run proved for the address phase.
+;   write: the nibble is driven at the end of "out pins, 4"; the rising edge
+;          lands one SM cycle later on "jmp x-- side 1" - one SM cycle of
+;          setup and one SM cycle of hold, identical to the address phase.
+; The previous 3-cycle data loops bought settling by lengthening the bit
+; period; the 2-cycle loops keep the proven absolute nanosecond margins and
+; raise the data SCLK from sysclk/(6*div) to sysclk/(2*div).
+;
 ; Read completion and write back-pressure are CPU/DMA events, not PIO IRQs:
-; the read loop clocks until the CPU stops the SM, and the write loop blocks
-; on PULL when the DMA has no more words. This keeps the program small and
-; avoids an extra IRQ path on the timing-critical cartridge core.
+; the read loop clocks until the CPU stops the SM (the two-instruction loop
+; wraps via .wrap_target/.wrap), and the write loop blocks on PULL when the
+; DMA has no more words. This keeps the program small and avoids an extra
+; IRQ path on the timing-critical cartridge core.
 ;
 ; Autopull is disabled: a blocking PULL explicitly loads the command/address
 ; word and each write word, so the read program can leave the OSR empty after
 ; the address without stalling. Autopush is enabled on the RX side.
+;
+; The write program is placed first so its entry address can never coincide
+; with the read loop's wrap address (a jump landing exactly on the wrap
+; address would be redirected to wrap_target).
 .program psram_quad
 .side_set 1
+
+; --------------------------------------------------------------------------
+; Entry: psram_quad_write
+;   TX: word0 = (0x38 << 24) | addr, then one word per 4 data bytes
+; --------------------------------------------------------------------------
+public psram_quad_write:
+    pull                    side 0
+    set x, 7                side 0
+wr_serial:
+    out pins, 1             side 0
+    jmp x-- wr_serial       side 1
+    set y, 5                side 0
+wr_addr:
+    out pins, 4             side 0
+    jmp y-- wr_addr         side 1
+wr_data:
+public psram_quad_write_idle:
+    pull                    side 0  ; block until the next data word arrives
+    set x, 7                side 0
+wr_nib:
+    out pins, 4             side 0  ; nibble driven while SCLK low
+    jmp x-- wr_nib          side 1  ; rising edge one cycle later (setup)
+    jmp wr_data             side 0  ; word done: SCLK low, fetch next word
 
 ; --------------------------------------------------------------------------
 ; Entry: psram_quad_read
@@ -47,31 +91,8 @@ rd_addr:
 rd_dummy:
     nop                     side 1
     jmp x-- rd_dummy        side 0  ; six dummy clocks, ending SCLK low
+.wrap_target
 rd_data:
-    nop                     side 1  ; SCLK high, let the device output settle
-    in pins, 4              side 1  ; sample quad data a half-cycle later
-    jmp rd_data             side 0
-
-; --------------------------------------------------------------------------
-; Entry: psram_quad_write
-;   TX: word0 = (0x38 << 24) | addr, then one word per 4 data bytes
-; --------------------------------------------------------------------------
-public psram_quad_write:
-    pull                    side 0
-    set x, 7                side 0
-wr_serial:
-    out pins, 1             side 0
-    jmp x-- wr_serial       side 1
-    set y, 5                side 0
-wr_addr:
-    out pins, 4             side 0
-    jmp y-- wr_addr         side 1
-wr_data:
-public psram_quad_write_idle:
-    pull                    side 0  ; block until the next data word arrives
-    set x, 7                side 0
-wr_nib:
-    out pins, 4             side 0  ; drive data while SCLK low
-    nop                     side 0  ; setup margin before the clock edge
-    jmp x-- wr_nib          side 1
-    jmp wr_data             side 0
+    nop                     side 1  ; rising edge at the end of this cycle
+    in pins, 4              side 0  ; sample one cycle later; SCLK low after
+.wrap

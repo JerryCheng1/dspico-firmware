@@ -144,7 +144,7 @@ M5 命中时，固件固定对应目录项，读取并验证 CRC 表及扇区数
 | `CACHE_BOOT_SECTOR0_SEED=ON` | 将启动时预热的 SD 扇区 0 用于首次对应读取。 |
 | `CACHE_SD_SECTORS=4096` | 旧扇区索引后端的 2 MiB 索引规模，不是完整页后端的容量上限。 |
 | `PSRAM_CACHE_FRAG_BYTES=32`、`PSRAM_PIO_FRAG_BYTES=32` | PSRAM 传输的数据片段上限。 |
-| `PSRAM_PIO_CLKDIV=3.0f` | 当前运行期 PIO 分频值。 |
+| `PSRAM_PIO_CLKDIV=3.0f` | PIO 初始分频值；数据相位为 2 个 SM 周期/nibble，启用 `PSRAM_BOOT_AUTOSWEEP` 时启动扫描在 1.5–3.0 中选最快通过四片自检的值（150 MHz 下 1.5 对应 50 MHz 数据时钟）。 |
 
 `CACHE_PAGE_ACTIVE_SETS` 由 CMake 的 `CACHE_PAGE_M5_SET_LIMIT` 派生，无需单独设置。独立的 `PsramQual` 目标可通过 `PSRAM_QUAL_FIRMWARE=ON` 构建，用于 PSRAM 资格测试，不属于游戏固件。
 

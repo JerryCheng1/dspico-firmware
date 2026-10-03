@@ -183,16 +183,17 @@ static bool pioRegionsPass(u32 chip, u8* wbuf, u8* rbuf)
 // highest passing SCLK.
 static bool sweepPioSpeeds(u32 chip, u8* wbuf, u8* rbuf)
 {
-    static const float divs[] = { 40.0f, 20.0f, 10.0f, 5.0f, 3.0f, 2.0f, 1.0f };
+    static const float divs[] = { 40.0f, 20.0f, 10.0f, 5.0f, 3.0f, 2.0f, 1.5f, 1.0f };
     float fastestDiv = 0.0f;
 
     for (unsigned i = 0; i < sizeof(divs) / sizeof(divs[0]); i++)
     {
         psramSetClockDiv(divs[i]);
         bool ok = pioRegionsPass(chip, wbuf, rbuf);
-        u32 cmdKhz = (u32)(clock_get_hz(clk_sys) / (2u * (u32)divs[i]) / 1000u);
-        u32 rdKhz = (u32)(clock_get_hz(clk_sys) / (3u * (u32)divs[i]) / 1000u);
-        LOG("[psram] chip=%lu pio div=%.0f cmd_sclk_khz=%lu rd_sclk_khz=%lu %s\n",
+        // All phases are 2 SM cycles per bit/nibble: SCLK = sysclk/(2*div).
+        u32 cmdKhz = (u32)(clock_get_hz(clk_sys) / (2.0f * divs[i]) / 1000u);
+        u32 rdKhz = cmdKhz;
+        LOG("[psram] chip=%lu pio div=%.1f cmd_sclk_khz=%lu rd_sclk_khz=%lu %s\n",
             (unsigned long)chip, (double)divs[i], (unsigned long)cmdKhz,
             (unsigned long)rdKhz, ok ? "OK" : "FAIL");
         if (ok)
@@ -201,9 +202,9 @@ static bool sweepPioSpeeds(u32 chip, u8* wbuf, u8* rbuf)
 
     psramSetClockDiv(PSRAM_PIO_CLKDIV);
     if (fastestDiv > 0.0f)
-        LOG("[psram] chip=%lu pio fastest_pass_div=%.0f rd_sclk_khz=%lu\n",
+        LOG("[psram] chip=%lu pio fastest_pass_div=%.1f rd_sclk_khz=%lu\n",
             (unsigned long)chip, (double)fastestDiv,
-            (unsigned long)(clock_get_hz(clk_sys) / (3u * (u32)fastestDiv) / 1000u));
+            (unsigned long)(clock_get_hz(clk_sys) / (2.0f * fastestDiv) / 1000u));
     else
         LOG("[psram] chip=%lu pio fastest_pass_div=none\n", (unsigned long)chip);
     return fastestDiv > 0.0f;
@@ -496,7 +497,7 @@ int main(void)
         engine ? "on" : "off", engine ? 4 : -1, engine ? 5 : -1,
         (double)PSRAM_PIO_CLKDIV,
         (unsigned long)(clock_get_hz(clk_sys) / (2u * (u32)PSRAM_PIO_CLKDIV) / 1000u),
-        (unsigned long)(clock_get_hz(clk_sys) / (3u * (u32)PSRAM_PIO_CLKDIV) / 1000u));
+        (unsigned long)(clock_get_hz(clk_sys) / (2u * (u32)PSRAM_PIO_CLKDIV) / 1000u));
     if (!engine)
     {
         gPsramUsePio = false;

@@ -75,7 +75,7 @@ set(L2_DIAG_MODE "M5" CACHE STRING "L2 diagnostic mode M0..M5 (design section 10
 option(L2_LEGACY_PUBLISH_FILL "Contrast build: old publish-then-fill behaviour (M3 only)" OFF)
 option(CACHE_WATCH_LOG "Core1 WFE/SysTick cache diagnostics with idle gating" OFF)
 option(CACHE_SUMMARY_LOG "Quiet one-line cache capacity, occupancy and hit-rate log" OFF)
-option(PSRAM_BOOT_AUTOSWEEP "Sweep PSRAM PIO divider from 1.0 to 3.0 in 0.1 steps at boot" OFF)
+option(PSRAM_BOOT_AUTOSWEEP "Sweep PSRAM PIO divider from 1.5 to 3.0 in 0.1 steps at boot" OFF)
 option(CACHE_WATCH_ACTIVE_MARKERS "Intrusive core0 phase/gate/recovery markers (diagnostic experiments only)" OFF)
 option(CACHE_FILL_QUIET_EXPERIMENT "Experimental M3/M4 fill or probe during a quiet acknowledged next-sector request" OFF)
 option(CACHE_M4_PROMOTE_M5_AFTER_PROBES "Experimental M4-to-M5 transition after 32 clean full-sector probes; promoted M5 defaults to read-only" OFF)

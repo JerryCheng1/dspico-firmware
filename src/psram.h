@@ -37,9 +37,13 @@
 #define PSRAM_PIO_FRAG_BYTES 32
 #define PSRAM_BB_FRAG_BYTES  16
 
-// PIO2 SCLK generation. The qual sweep (docs/cache-stage-S2.md) measured the
-// read-data limit at div=2 and a safe pass at div=3 (rd_sclk ~= 22 MHz on this
-// board); div=3 leaves one step of margin, so the runtime cache uses it.
+// PIO2 SCLK generation. Every PSRAM phase (command, address, dummy, read
+// data, write data) now runs 2 SM cycles per bit/nibble, so all edges are
+// sysclk / (2 * div) and the settling/hold per edge is exactly one SM cycle
+// (div / sysclk). The board's proven limit is ~10 ns per edge: at 200 MHz the
+// qual sweep proved div=2, at 150 MHz the boot sweep selects div=1.5 (50 MHz
+// edges). This constant is only the initial value; PSRAM_BOOT_AUTOSWEEP or
+// the qualification sweep re-tunes it, and unvalidated builds stay on 3.0.
 #define PSRAM_PIO_CLKDIV 3.0f
 
 typedef struct
@@ -117,8 +121,8 @@ void psramGpioInit(void);
 bool psramEngineInit(void);
 
 // Reconfigure the PIO2 SM0 clock divider at runtime (qualification sweep).
-// SCLK = sysclk / (2 * div) for the one-bit phases; the read phase is 3 SM
-// cycles per nibble, so its SCLK is sysclk / (3 * div).
+// All phases are 2 SM cycles per bit/nibble, so SCLK = sysclk / (2 * div)
+// and every setup/hold/settling window is one SM cycle = div / sysclk.
 void psramSetClockDiv(float div);
 float psramGetClockDiv(void);
 
